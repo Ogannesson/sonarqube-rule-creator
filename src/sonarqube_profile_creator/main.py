@@ -2,30 +2,38 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import logging
 import os
+import shutil
+import struct
 import sys
 import time
 import urllib.request
 import webbrowser
+import zipfile
 from pathlib import Path
 from typing import TextIO
 
 import flet as ft
+import flet_desktop
+import flet_desktop.version
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from sonarqube_profile_creator.config import user_config_dir
+    from sonarqube_profile_creator.config import APP_DISPLAY_NAME, local_cache_dir, user_config_dir
     from sonarqube_profile_creator.gui import app
     from sonarqube_profile_creator.spreadsheet import write_example_templates
 else:
-    from .config import user_config_dir
+    from .config import APP_DISPLAY_NAME, local_cache_dir, user_config_dir
     from .gui import app
     from .spreadsheet import write_example_templates
 
 _STDIO_HANDLES: list[TextIO] = []
 INSTANCE_FILE = "instance.json"
+RT_ICON = 3
+RT_GROUP_ICON = 14
 
 
 def _configure_logging() -> Path:
@@ -59,8 +67,8 @@ def main(argv: list[str] | None = None) -> int:
     logging.info("Starting SonarQube Profile Creator")
     parser = argparse.ArgumentParser(description="SonarQube Profile Creator")
     parser.add_argument("--create-templates", type=Path, help="Create example CSV/XLSX templates in the target directory.")
-    parser.add_argument("--web", action="store_true", help="Run Flet in web mode for development.")
-    parser.add_argument("--desktop", action="store_true", help="Run with the Flet desktop client.")
+    parser.add_argument("--web", action="store_true", help="Run in browser mode for development.")
+    parser.add_argument("--desktop", action="store_true", help="Run with the Flet desktop client. This is the default.")
     args = parser.parse_args(argv)
 
     if args.create_templates:
@@ -70,15 +78,127 @@ def main(argv: list[str] | None = None) -> int:
         logging.info("Created templates: %s, %s", csv_path, xlsx_path)
         return 0
 
-    view = ft.AppView.FLET_APP if args.desktop else ft.AppView.WEB_BROWSER
+    view = _select_app_view(web=args.web)
     if view == ft.AppView.WEB_BROWSER and _open_existing_instance():
         logging.info("Opened existing instance")
         return 0
     logging.info("Using view=%s log=%s", view, log_path)
+    os.environ["SONARQUBE_PROFILE_CREATOR_VIEW"] = "web" if view == ft.AppView.WEB_BROWSER else "desktop"
     app_view_url = _register_instance_later(view, time.time())
-    ft.run(main=app, view=view, host="127.0.0.1", port=0)
+    _run_flet_app(view)
     _clear_instance(app_view_url)
     return 0
+
+
+def _select_app_view(web: bool = False) -> ft.AppView:
+    return ft.AppView.WEB_BROWSER if web else ft.AppView.FLET_APP
+
+
+def _run_flet_app(view: ft.AppView) -> None:
+    if view == ft.AppView.FLET_APP:
+        _prepare_flet_desktop_runtime()
+    ft.run(main=app, name=APP_DISPLAY_NAME, view=view, host="127.0.0.1", port=0, assets_dir=str(_assets_dir()))
+
+
+def _assets_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(getattr(sys, "_MEIPASS")) / "assets"
+    return Path(__file__).resolve().parents[2] / "assets"
+
+
+def _prepare_flet_desktop_runtime() -> Path | None:
+    if os.environ.get("FLET_VIEW_PATH"):
+        return None
+    if os.name != "nt":
+        return None
+
+    version = flet_desktop.version.version
+    cache_root = local_cache_dir() / "flet"
+    icon_path = _assets_dir() / "app_icon.ico"
+    icon_fingerprint = _file_fingerprint(icon_path)
+    runtime_name = f"flet-desktop-full-{version}.{icon_fingerprint}"
+    runtime_dir = cache_root / runtime_name
+    marker_value = f"{version}:{icon_fingerprint}:patched"
+    marker_path = runtime_dir / ".sonarqube-profile-creator-ready"
+    flet_exe = runtime_dir / "flet" / "flet.exe"
+    if marker_path.exists() and flet_exe.exists() and marker_path.read_text(encoding="utf-8") == marker_value:
+        os.environ["FLET_VIEW_PATH"] = str(flet_exe.parent)
+        return runtime_dir
+
+    cache_root.mkdir(parents=True, exist_ok=True)
+    _clear_stale_flet_runtime_dirs(cache_root, f"flet-desktop-full-{version}", keep=runtime_dir)
+    shutil.rmtree(runtime_dir, ignore_errors=True)
+
+    archive_path = Path(flet_desktop.get_package_bin_dir()) / flet_desktop.get_artifact_filename()
+    if not archive_path.exists():
+        return None
+
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        with zipfile.ZipFile(archive_path, "r") as archive:
+            archive.extractall(runtime_dir)
+        if _copy_icon_to_flet_view(flet_exe, icon_path):
+            marker_path.write_text(marker_value, encoding="utf-8")
+        else:
+            marker_path.write_text(f"{version}:{icon_fingerprint}:unpatched", encoding="utf-8")
+    except Exception:
+        shutil.rmtree(runtime_dir, ignore_errors=True)
+        raise
+
+    os.environ["FLET_VIEW_PATH"] = str(flet_exe.parent)
+    return runtime_dir
+
+
+def _clear_stale_flet_runtime_dirs(cache_root: Path, runtime_name: str, keep: Path | None = None) -> None:
+    paths = [cache_root / runtime_name, *cache_root.glob(f"{runtime_name}.*")]
+    keep_resolved = keep.resolve() if keep else None
+    for path in paths:
+        if path.is_dir() and (keep_resolved is None or path.resolve() != keep_resolved):
+            shutil.rmtree(path, ignore_errors=True)
+
+
+def _copy_icon_to_flet_view(flet_exe: Path, icon_path: Path) -> bool:
+    if not flet_exe.exists() or not icon_path.exists():
+        return False
+    try:
+        from win32ctypes.pywin32 import win32api
+
+        group_data, icon_images = _read_ico_resource(icon_path)
+        handle = win32api.BeginUpdateResource(str(flet_exe), 0)
+        try:
+            win32api.UpdateResource(handle, RT_GROUP_ICON, 1, group_data)
+            for icon_id, image_data in icon_images:
+                win32api.UpdateResource(handle, RT_ICON, icon_id, image_data)
+            win32api.EndUpdateResource(handle, 0)
+        except Exception:
+            win32api.EndUpdateResource(handle, 1)
+            raise
+    except Exception:
+        logging.exception("Failed to apply app icon to Flet desktop runtime")
+        return False
+    return True
+
+
+def _read_ico_resource(icon_path: Path) -> tuple[bytes, list[tuple[int, bytes]]]:
+    data = icon_path.read_bytes()
+    reserved, icon_type, count = struct.unpack_from("<HHH", data, 0)
+    entries = []
+    images = []
+    group = [struct.pack("<HHH", reserved, icon_type, count)]
+    for index in range(count):
+        offset = 6 + index * 16
+        width, height, color_count, reserved_byte, planes, bit_count, size, image_offset = struct.unpack_from("<BBBBHHII", data, offset)
+        icon_id = index + 1
+        entries.append((icon_id, data[image_offset : image_offset + size]))
+        group.append(struct.pack("<BBBBHHIH", width, height, color_count, reserved_byte, planes, bit_count, size, icon_id))
+    images.extend(entries)
+    return b"".join(group), images
+
+
+def _file_fingerprint(path: Path) -> str:
+    if not path.exists():
+        return "missing"
+    return hashlib.sha256(path.read_bytes()).hexdigest()[:16]
 
 
 def _instance_path() -> Path:

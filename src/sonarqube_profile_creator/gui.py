@@ -1,19 +1,18 @@
 from __future__ import annotations
 
 import os
-import signal
 import subprocess
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 import flet as ft
 
-from .config import AppConfig, ConfigStore, reports_dir, user_config_dir
+from .config import APP_DISPLAY_NAME, AppConfig, ConfigStore, reports_dir, user_config_dir
 from .i18n import Translator, detect_language
-from .models import ALL_FIELDS, FieldMapping, ItemStatus, ProfileStrategy, SpreadsheetData
+from .models import ALL_FIELDS, FieldMapping, ItemStatus, ProfileStrategy, RuleRow, SpreadsheetData
 from .reports import export_apply_report, export_precheck_report
 from .sonarqube import ConnectionInfo, SonarQubeClient, SonarQubeError
 from .spreadsheet import read_spreadsheet, rows_from_mapping, validate_required_mapping
@@ -41,6 +40,12 @@ NEUTRAL_SOFT = "#EEF2F6"
 SIDEBAR = "#111827"
 SIDEBAR_MUTED = "#9CA3AF"
 EXIT_DELAY_SECONDS = 15
+TITLE_BAR_HEIGHT = 58
+RESIZE_HANDLE_SIZE = 8
+FONT_FAMILY = "Microsoft YaHei"
+WEIGHT_REGULAR = ft.FontWeight.W_400
+WEIGHT_MEDIUM = ft.FontWeight.W_500
+WEIGHT_SEMIBOLD = ft.FontWeight.W_600
 
 
 class ProfileCreatorApp:
@@ -104,23 +109,37 @@ class ProfileCreatorApp:
         self.strategy_group = ft.RadioGroup(
             value=self.config.default_strategy or ProfileStrategy.EXTEND_DEFAULT.value,
             content=ft.Column([]),
-            on_change=lambda _e: self.render(),
+            on_change=self._on_strategy_change,
         )
-        self.parent_dropdown = ft.Dropdown(label=self.t("parent_profile"), width=420, border_color=LINE, focused_border_color=PRIMARY)
-        self.copy_dropdown = ft.Dropdown(label=self.t("source_profile"), width=420, border_color=LINE, focused_border_color=PRIMARY)
+        self.strategy_detail = ft.Column([], spacing=8)
+        self.parent_dropdowns: dict[str, ft.Dropdown] = {}
+        self.copy_dropdowns: dict[str, ft.Dropdown] = {}
         self.precheck_status = ft.Text("", color=TEXT_MUTED)
         self.progress = ft.ProgressBar(visible=False, color=PRIMARY, bgcolor=PRIMARY_SOFT)
         self.main_area = ft.Column([], expand=True, scroll=ft.ScrollMode.AUTO)
         self._disconnect_token = 0
         self._connected = True
+        self._exit_requested = False
 
     def run(self) -> None:
-        self.page.title = self.t("app_title")
+        self.page.title = APP_DISPLAY_NAME
         self.page.theme_mode = ft.ThemeMode.LIGHT
+        self.page.theme = ft.Theme(font_family=FONT_FAMILY)
         self.page.window.width = 1320
         self.page.window.height = 860
+        self.page.window.min_width = 980
+        self.page.window.min_height = 680
+        self.page.window.movable = True
+        self.page.window.resizable = True
+        self.page.window.minimizable = True
+        self.page.window.maximizable = True
+        self.page.window.frameless = True
+        self.page.window.title_bar_hidden = True
+        self.page.window.title_bar_buttons_hidden = True
+        self.page.window.shadow = True
         self.page.padding = 0
         self.page.bgcolor = APP_BG
+        self.page.window.on_event = self._on_window_event
         self.page.on_connect = self._on_connect
         self.page.on_disconnect = self._on_disconnect
         self.page.services.append(self.file_picker)
@@ -131,36 +150,42 @@ class ProfileCreatorApp:
 
     def render(self) -> None:
         self.page.clean()
-        self.page.title = self.t("app_title")
+        self.page.title = APP_DISPLAY_NAME
         self.page.bgcolor = APP_BG
         self.page.padding = 0
         self.server_url.label = self.t("server_url")
         self.token.label = self.t("token")
         self.remember_token.label = self.t("remember_token")
         self.file_path.label = self.t("selected_file")
-        self.parent_dropdown.label = self.t("parent_profile")
-        self.copy_dropdown.label = self.t("source_profile")
         self._refresh_strategy_options()
 
         self.page.add(
-            ft.Container(
-                content=ft.Column(
-                    [
-                        self._top_bar(),
-                        self.progress,
-                        ft.Row(
+            ft.Stack(
+                controls=[
+                    ft.Container(
+                        content=ft.Column(
                             [
-                                self._sidebar(),
-                                self._workspace(),
+                                self._top_bar(),
+                                self.progress,
+                                ft.Row(
+                                    [
+                                        self._sidebar(),
+                                        self._workspace(),
+                                    ],
+                                    spacing=0,
+                                    expand=True,
+                                    vertical_alignment=ft.CrossAxisAlignment.STRETCH,
+                                ),
                             ],
                             spacing=0,
                             expand=True,
-                            vertical_alignment=ft.CrossAxisAlignment.STRETCH,
                         ),
-                    ],
-                    spacing=0,
-                    expand=True,
-                ),
+                        border=_border_all(LINE_SOFT),
+                        expand=True,
+                    ),
+                    *self._resize_handles(),
+                ],
+                fit=ft.StackFit.EXPAND,
                 expand=True,
             )
         )
@@ -171,67 +196,137 @@ class ProfileCreatorApp:
         return ft.Container(
             content=ft.Row(
                 [
-                    ft.Row(
-                        [
-                            ft.Container(
-                                content=ft.Icon(ft.Icons.ADMIN_PANEL_SETTINGS, color=ft.Colors.WHITE, size=22),
-                                width=42,
-                                height=42,
-                                bgcolor=PRIMARY,
-                                border_radius=8,
-                                alignment=ft.Alignment(0, 0),
-                            ),
-                            ft.Column(
+                    ft.WindowDragArea(
+                        content=ft.Container(
+                            content=ft.Row(
                                 [
-                                    ft.Text(self.t("app_title"), size=20, weight=ft.FontWeight.BOLD, color=TEXT),
-                                    ft.Text(self.t("app_subtitle"), size=13, color=TEXT_MUTED),
+                                    ft.Container(
+                                        content=ft.Image(src="app_icon.png", fit=ft.BoxFit.COVER, border_radius=7),
+                                        width=34,
+                                        height=34,
+                                        border_radius=7,
+                                        clip_behavior=ft.ClipBehavior.ANTI_ALIAS,
+                                        alignment=ft.Alignment(0, 0),
+                                    ),
+                                    ft.Column(
+                                        [
+                                            ft.Text(self.t("app_title"), size=15, weight=WEIGHT_SEMIBOLD, color=TEXT),
+                                            ft.Text(self.t("app_subtitle"), size=11, color=TEXT_MUTED),
+                                        ],
+                                        spacing=0,
+                                        alignment=ft.MainAxisAlignment.CENTER,
+                                    ),
                                 ],
-                                spacing=1,
+                                spacing=10,
+                                vertical_alignment=ft.CrossAxisAlignment.CENTER,
                             ),
-                        ],
-                        spacing=12,
-                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                            padding=_padding_symmetric(horizontal=16, vertical=0),
+                            height=TITLE_BAR_HEIGHT,
+                            expand=True,
+                        ),
+                        maximizable=True,
                         expand=True,
                     ),
-                    self._status_chip(
-                        self._connection_label(),
-                        ft.Icons.CHECK_CIRCLE if self.connection_info else ft.Icons.RADIO_BUTTON_UNCHECKED,
-                        SUCCESS_SOFT if self.connection_info else NEUTRAL_SOFT,
-                        SUCCESS if self.connection_info else TEXT_MUTED,
-                    ),
-                    self._status_chip(
-                        self._file_label(),
-                        ft.Icons.DESCRIPTION if self.spreadsheet else ft.Icons.INSERT_DRIVE_FILE,
-                        PRIMARY_SOFT if self.spreadsheet else NEUTRAL_SOFT,
-                        PRIMARY if self.spreadsheet else TEXT_MUTED,
-                    ),
-                    ft.OutlinedButton(
-                        lang_label,
-                        icon=ft.Icons.LANGUAGE,
-                        on_click=self._toggle_language,
-                        height=42,
-                    ),
-                    ft.OutlinedButton(
-                        self.t("exit_app"),
-                        icon=ft.Icons.LOGOUT,
-                        on_click=self._confirm_exit,
-                        height=42,
+                    ft.Row(
+                        [
+                            self._status_chip(
+                                self._connection_label(),
+                                ft.Icons.CHECK_CIRCLE if self.connection_info else ft.Icons.RADIO_BUTTON_UNCHECKED,
+                                SUCCESS_SOFT if self.connection_info else NEUTRAL_SOFT,
+                                SUCCESS if self.connection_info else TEXT_MUTED,
+                            ),
+                            self._status_chip(
+                                self._file_label(),
+                                ft.Icons.DESCRIPTION if self.spreadsheet else ft.Icons.INSERT_DRIVE_FILE,
+                                PRIMARY_SOFT if self.spreadsheet else NEUTRAL_SOFT,
+                                PRIMARY if self.spreadsheet else TEXT_MUTED,
+                            ),
+                            self._window_button(
+                                ft.Icons.LANGUAGE,
+                                lang_label,
+                                self._toggle_language,
+                            ),
+                            self._window_button(
+                                ft.Icons.MINIMIZE,
+                                self.t("minimize_window"),
+                                self._minimize_window,
+                            ),
+                            self._window_button(
+                                ft.Icons.CROP_SQUARE,
+                                self.t("maximize_window"),
+                                self._toggle_maximize_window,
+                            ),
+                            self._window_button(
+                                ft.Icons.CLOSE,
+                                self.t("close_window"),
+                                self._confirm_exit,
+                                danger=True,
+                            ),
+                        ],
+                        spacing=4,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
                     ),
                 ],
-                spacing=12,
+                spacing=0,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
             ),
-            height=78,
-            padding=_padding_symmetric(horizontal=24, vertical=10),
+            height=TITLE_BAR_HEIGHT,
+            padding=ft.Padding(left=0, top=0, right=8, bottom=0),
             bgcolor=SURFACE,
             border=ft.Border(bottom=ft.BorderSide(width=1, color=LINE_SOFT)),
         )
+
+    def _window_button(self, icon: str, tooltip: str, on_click: Any, danger: bool = False) -> ft.Control:
+        return ft.IconButton(
+            icon=icon,
+            tooltip=tooltip,
+            on_click=on_click,
+            width=36,
+            height=36,
+            icon_size=18,
+            icon_color=DANGER if danger else TEXT_MUTED,
+            hover_color=DANGER_SOFT if danger else SURFACE_MUTED,
+            splash_radius=18,
+        )
+
+    def _resize_handles(self) -> list[ft.Control]:
+        side = RESIZE_HANDLE_SIZE
+        return [
+            self._resize_handle(ft.WindowResizeEdge.TOP_LEFT, ft.MouseCursor.RESIZE_UP_LEFT, left=0, top=0, width=side, height=side),
+            self._resize_handle(ft.WindowResizeEdge.TOP_RIGHT, ft.MouseCursor.RESIZE_UP_RIGHT, right=0, top=0, width=side, height=side),
+            self._resize_handle(ft.WindowResizeEdge.BOTTOM_LEFT, ft.MouseCursor.RESIZE_DOWN_LEFT, left=0, bottom=0, width=side, height=side),
+            self._resize_handle(ft.WindowResizeEdge.BOTTOM_RIGHT, ft.MouseCursor.RESIZE_DOWN_RIGHT, right=0, bottom=0, width=side, height=side),
+            self._resize_handle(ft.WindowResizeEdge.TOP, ft.MouseCursor.RESIZE_UP_DOWN, left=side, right=side, top=0, height=side),
+            self._resize_handle(ft.WindowResizeEdge.BOTTOM, ft.MouseCursor.RESIZE_UP_DOWN, left=side, right=side, bottom=0, height=side),
+            self._resize_handle(ft.WindowResizeEdge.LEFT, ft.MouseCursor.RESIZE_LEFT_RIGHT, left=0, top=side, bottom=side, width=side),
+            self._resize_handle(ft.WindowResizeEdge.RIGHT, ft.MouseCursor.RESIZE_LEFT_RIGHT, right=0, top=side, bottom=side, width=side),
+        ]
+
+    def _resize_handle(self, edge: ft.WindowResizeEdge, cursor: ft.MouseCursor, **position: float) -> ft.Control:
+        return ft.GestureDetector(
+            content=ft.Container(bgcolor=ft.Colors.TRANSPARENT),
+            mouse_cursor=cursor,
+            on_pan_down=lambda _event, resize_edge=edge: self._start_window_resize(resize_edge),
+            drag_interval=1,
+            **position,
+        )
+
+    def _start_window_resize(self, edge: ft.WindowResizeEdge) -> None:
+        self.page.run_task(self.page.window.start_resizing, edge)
+
+    def _minimize_window(self, _event: Any) -> None:
+        self.page.window.minimized = True
+        self.page.update()
+
+    def _toggle_maximize_window(self, _event: Any) -> None:
+        self.page.window.maximized = not bool(self.page.window.maximized)
+        self.page.update()
 
     def _sidebar(self) -> ft.Control:
         return ft.Container(
             content=ft.Column(
                 [
-                    ft.Text(self.t("workflow"), size=12, color=SIDEBAR_MUTED, weight=ft.FontWeight.BOLD),
+                    ft.Text(self.t("workflow"), size=12, color=SIDEBAR_MUTED, weight=WEIGHT_SEMIBOLD),
                     ft.Column([self._step_nav_item(index, title) for index, title in enumerate(self._step_titles())], spacing=8),
                     ft.Divider(color="#293241"),
                     self._sidebar_hint(),
@@ -279,7 +374,7 @@ class ProfileCreatorApp:
                 [
                     ft.Column(
                         [
-                            ft.Text(self._current_step_title(), size=26, weight=ft.FontWeight.BOLD, color=TEXT),
+                            ft.Text(self._current_step_title(), size=26, weight=WEIGHT_SEMIBOLD, color=TEXT),
                             ft.Text(self._current_step_description(), size=14, color=TEXT_MUTED),
                         ],
                         spacing=4,
@@ -337,7 +432,7 @@ class ProfileCreatorApp:
                     ),
                     ft.Column(
                         [
-                            ft.Text(title, size=14, weight=ft.FontWeight.BOLD if current else ft.FontWeight.W_500, color=ft.Colors.WHITE if current else "#D1D5DB"),
+                            ft.Text(title, size=14, weight=WEIGHT_SEMIBOLD if current else WEIGHT_REGULAR, color=ft.Colors.WHITE if current else "#D1D5DB"),
                             ft.Text(self._step_state_label(index), size=12, color="#BFDBFE" if current else SIDEBAR_MUTED),
                         ],
                         spacing=0,
@@ -374,7 +469,7 @@ class ProfileCreatorApp:
         return ft.Container(
             content=ft.Column(
                 [
-                    ft.Text(self.t("operator_note"), size=13, color=ft.Colors.WHITE, weight=ft.FontWeight.BOLD),
+                    ft.Text(self.t("operator_note"), size=13, color=ft.Colors.WHITE, weight=WEIGHT_SEMIBOLD),
                     ft.Text(self.t("operator_note_body"), size=12, color=SIDEBAR_MUTED),
                 ],
                 spacing=6,
@@ -459,11 +554,7 @@ class ProfileCreatorApp:
         )
 
     def _strategy_panel(self) -> ft.Control:
-        parent_controls: list[ft.Control] = []
-        if self.strategy_group.value == ProfileStrategy.EXTEND_SELECTED.value:
-            parent_controls.append(self.parent_dropdown)
-        if self.strategy_group.value == ProfileStrategy.COPY.value:
-            parent_controls.append(self.copy_dropdown)
+        self._refresh_strategy_detail()
         return self._section(
             self.t("strategy"),
             self.t("desc_strategy"),
@@ -471,11 +562,24 @@ class ProfileCreatorApp:
             ft.Column(
                 [
                     self.strategy_group,
-                    ft.Row(parent_controls, wrap=True) if parent_controls else self._inline_status(self._strategy_help_text(), TEXT_MUTED, ft.Icons.INFO),
+                    self.strategy_detail,
                 ],
                 spacing=8,
             ),
         )
+
+    def _strategy_detail_control(self) -> ft.Control:
+        parent_controls: list[ft.Control] = []
+        if self.strategy_group.value == ProfileStrategy.EXTEND_SELECTED.value:
+            parent_controls.append(self._language_profile_selectors(self.parent_dropdowns, "parent_profile"))
+        if self.strategy_group.value == ProfileStrategy.COPY.value:
+            parent_controls.append(self._language_profile_selectors(self.copy_dropdowns, "source_profile"))
+        if parent_controls:
+            return ft.Column(parent_controls, spacing=8)
+        return self._inline_status(self._strategy_help_text(), TEXT_MUTED, ft.Icons.INFO)
+
+    def _refresh_strategy_detail(self) -> None:
+        self.strategy_detail.controls = [self._strategy_detail_control()]
 
     def _precheck_panel(self) -> ft.Control:
         return self._section(
@@ -577,7 +681,7 @@ class ProfileCreatorApp:
                             ),
                             ft.Column(
                                 [
-                                    ft.Text(title, size=18, weight=ft.FontWeight.BOLD, color=TEXT),
+                                    ft.Text(title, size=18, weight=WEIGHT_SEMIBOLD, color=TEXT),
                                     ft.Text(subtitle, size=13, color=TEXT_MUTED),
                                 ],
                                 spacing=2,
@@ -651,7 +755,7 @@ class ProfileCreatorApp:
             [
                 ft.Row(
                     [
-                        ft.Text(self.t("field_mapping"), weight=ft.FontWeight.BOLD, color=TEXT),
+                        ft.Text(self.t("field_mapping"), weight=WEIGHT_SEMIBOLD, color=TEXT),
                         self._status_chip(
                             missing_text,
                             ft.Icons.ERROR_OUTLINE if missing else ft.Icons.CHECK_CIRCLE,
@@ -680,7 +784,7 @@ class ProfileCreatorApp:
         return self._table_block(
             self.t("preview"),
             ft.DataTable(
-                columns=[ft.DataColumn(ft.Text(header, size=12, weight=ft.FontWeight.BOLD, color=TEXT)) for header in headers],
+                columns=[ft.DataColumn(ft.Text(header, size=12, weight=WEIGHT_SEMIBOLD, color=TEXT)) for header in headers],
                 rows=rows,
                 heading_row_color=SURFACE_MUTED,
                 column_spacing=18,
@@ -721,7 +825,7 @@ class ProfileCreatorApp:
                     ),
                     ft.Column(
                         [
-                            ft.Text(value, size=22, weight=ft.FontWeight.BOLD, color=TEXT),
+                            ft.Text(value, size=22, weight=WEIGHT_SEMIBOLD, color=TEXT),
                             ft.Text(label, size=12, color=TEXT_MUTED),
                         ],
                         spacing=0,
@@ -759,11 +863,11 @@ class ProfileCreatorApp:
             self.t("details"),
             ft.DataTable(
                 columns=[
-                    ft.DataColumn(ft.Text("status", size=12, weight=ft.FontWeight.BOLD)),
-                    ft.DataColumn(ft.Text("category", size=12, weight=ft.FontWeight.BOLD)),
-                    ft.DataColumn(ft.Text("row", size=12, weight=ft.FontWeight.BOLD)),
-                    ft.DataColumn(ft.Text("message", size=12, weight=ft.FontWeight.BOLD)),
-                    ft.DataColumn(ft.Text("suggestion", size=12, weight=ft.FontWeight.BOLD)),
+                    ft.DataColumn(ft.Text("status", size=12, weight=WEIGHT_SEMIBOLD)),
+                    ft.DataColumn(ft.Text("category", size=12, weight=WEIGHT_SEMIBOLD)),
+                    ft.DataColumn(ft.Text("row", size=12, weight=WEIGHT_SEMIBOLD)),
+                    ft.DataColumn(ft.Text("message", size=12, weight=WEIGHT_SEMIBOLD)),
+                    ft.DataColumn(ft.Text("suggestion", size=12, weight=WEIGHT_SEMIBOLD)),
                 ],
                 rows=rows,
                 heading_row_color=SURFACE_MUTED,
@@ -793,12 +897,12 @@ class ProfileCreatorApp:
             self.t("details"),
             ft.DataTable(
                 columns=[
-                    ft.DataColumn(ft.Text("status", size=12, weight=ft.FontWeight.BOLD)),
-                    ft.DataColumn(ft.Text("action", size=12, weight=ft.FontWeight.BOLD)),
-                    ft.DataColumn(ft.Text("language", size=12, weight=ft.FontWeight.BOLD)),
-                    ft.DataColumn(ft.Text("profile", size=12, weight=ft.FontWeight.BOLD)),
-                    ft.DataColumn(ft.Text("rule", size=12, weight=ft.FontWeight.BOLD)),
-                    ft.DataColumn(ft.Text("message", size=12, weight=ft.FontWeight.BOLD)),
+                    ft.DataColumn(ft.Text("status", size=12, weight=WEIGHT_SEMIBOLD)),
+                    ft.DataColumn(ft.Text("action", size=12, weight=WEIGHT_SEMIBOLD)),
+                    ft.DataColumn(ft.Text("language", size=12, weight=WEIGHT_SEMIBOLD)),
+                    ft.DataColumn(ft.Text("profile", size=12, weight=WEIGHT_SEMIBOLD)),
+                    ft.DataColumn(ft.Text("rule", size=12, weight=WEIGHT_SEMIBOLD)),
+                    ft.DataColumn(ft.Text("message", size=12, weight=WEIGHT_SEMIBOLD)),
                 ],
                 rows=rows,
                 heading_row_color=SURFACE_MUTED,
@@ -819,7 +923,7 @@ class ProfileCreatorApp:
                 [
                     ft.Row(
                         [
-                            ft.Text(label, size=13, weight=ft.FontWeight.BOLD, color=TEXT),
+                            ft.Text(label, size=13, weight=WEIGHT_SEMIBOLD, color=TEXT),
                             self._mini_badge(self.t("required") if required else self.t("optional"), DANGER if required else TEXT_MUTED, DANGER_SOFT if required else NEUTRAL_SOFT),
                         ],
                         spacing=8,
@@ -840,7 +944,7 @@ class ProfileCreatorApp:
         return ft.Container(
             content=ft.Column(
                 [
-                    ft.Text(title, weight=ft.FontWeight.BOLD, color=TEXT),
+                    ft.Text(title, weight=WEIGHT_SEMIBOLD, color=TEXT),
                     ft.Container(
                         content=ft.Row([table], scroll=ft.ScrollMode.AUTO),
                         border=_border_all(LINE_SOFT),
@@ -889,7 +993,7 @@ class ProfileCreatorApp:
             content=ft.Row(
                 [
                     ft.Icon(icon, color=color, size=16),
-                    ft.Text(text, size=12, color=color, weight=ft.FontWeight.BOLD, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
+                    ft.Text(text, size=12, color=color, weight=WEIGHT_SEMIBOLD, max_lines=1, overflow=ft.TextOverflow.ELLIPSIS),
                 ],
                 spacing=6,
                 vertical_alignment=ft.CrossAxisAlignment.CENTER,
@@ -901,7 +1005,7 @@ class ProfileCreatorApp:
 
     def _mini_badge(self, text: str, color: str, bgcolor: str) -> ft.Control:
         return ft.Container(
-            content=ft.Text(text, size=11, color=color, weight=ft.FontWeight.BOLD),
+            content=ft.Text(text, size=11, color=color, weight=WEIGHT_SEMIBOLD),
             padding=_padding_symmetric(horizontal=7, vertical=3),
             bgcolor=bgcolor,
             border_radius=999,
@@ -945,6 +1049,12 @@ class ProfileCreatorApp:
             columns=12,
         )
 
+    def _on_strategy_change(self, _event: Any) -> None:
+        self.config.default_strategy = str(self.strategy_group.value or ProfileStrategy.EXTEND_DEFAULT.value)
+        self.store.save(self.config)
+        self._refresh_strategy_detail()
+        self.strategy_detail.update()
+
     def _strategy_help_text(self) -> str:
         if self.strategy_group.value == ProfileStrategy.EXTEND_DEFAULT.value:
             return self.t("strategy_help_extend_default")
@@ -956,17 +1066,22 @@ class ProfileCreatorApp:
             return self.t("strategy_help_copy")
         return self.t("strategy_help_extend_default")
 
-    def _choose_file(self, _event: Any) -> None:
-        files = self.file_picker.pick_files(
+    async def _choose_file(self, _event: Any) -> None:
+        files = await self.file_picker.pick_files(
             allow_multiple=False,
             allowed_extensions=["csv", "xlsx", "xlsm"],
             dialog_title=self.t("choose_file"),
         )
-        if files:
-            self.file_path.value = files[0].path
-            self.config.last_file = self.file_path.value
-            self.store.save(self.config)
-            self.page.update()
+        self._apply_picked_files(files)
+
+    def _apply_picked_files(self, files: Iterable[Any]) -> None:
+        file_list = list(files)
+        if not file_list:
+            return
+        self.file_path.value = str(file_list[0].path or "")
+        self.config.last_file = self.file_path.value
+        self.store.save(self.config)
+        self.page.update()
 
     def _connect(self, _event: Any) -> None:
         self._run_background(self._connect_worker)
@@ -996,7 +1111,8 @@ class ProfileCreatorApp:
             self._set_status(self.connection_status, f"{self.t('connection_failed')}: {exc}", DANGER)
         finally:
             self._set_busy(False)
-            self.render()
+            if not self._exit_requested:
+                self.render()
 
     def _load_available_profiles(self, client: SonarQubeClient) -> dict[str, list[str]]:
         profiles_by_language: dict[str, list[str]] = {}
@@ -1012,14 +1128,60 @@ class ProfileCreatorApp:
         return {language: sorted(set(names)) for language, names in profiles_by_language.items()}
 
     def _refresh_profile_dropdowns(self) -> None:
-        names = sorted({name for names in self.available_profiles.values() for name in names})
-        options = [ft.DropdownOption(key=name, text=name) for name in names]
-        self.parent_dropdown.options = options
-        self.copy_dropdown.options = options
-        if not self.parent_dropdown.value and names:
-            self.parent_dropdown.value = names[0]
-        if not self.copy_dropdown.value and names:
-            self.copy_dropdown.value = names[0]
+        for controls in (self.parent_dropdowns, self.copy_dropdowns):
+            for language, dropdown in controls.items():
+                self._configure_language_dropdown(language, dropdown)
+
+    def _language_profile_selectors(self, controls: dict[str, ft.Dropdown], label_key: str) -> ft.Control:
+        languages = self._input_languages()
+        if not languages:
+            return self._inline_status(self.t("language_profile_empty"), TEXT_MUTED, ft.Icons.INFO)
+        rows = []
+        for language in languages:
+            dropdown = controls.get(language)
+            if dropdown is None:
+                dropdown = ft.Dropdown(width=420, enable_search=True, border_color=LINE, focused_border_color=PRIMARY, border_radius=6)
+                controls[language] = dropdown
+            dropdown.label = self.t(label_key)
+            self._configure_language_dropdown(language, dropdown)
+            rows.append(
+                ft.Container(
+                    content=ft.Row(
+                        [
+                            self._mini_badge(language, PRIMARY, PRIMARY_SOFT),
+                            dropdown,
+                        ],
+                        spacing=10,
+                        wrap=True,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    padding=_padding_all(10),
+                    bgcolor=SURFACE_MUTED,
+                    border=_border_all(LINE_SOFT),
+                    border_radius=8,
+                )
+            )
+        return ft.Column(
+            [
+                self._inline_status(self.t("language_profile_hint"), TEXT_MUTED, ft.Icons.INFO),
+                ft.Column(rows, spacing=8),
+            ],
+            spacing=8,
+        )
+
+    def _configure_language_dropdown(self, language: str, dropdown: ft.Dropdown) -> None:
+        names = self.available_profiles.get(language, [])
+        dropdown.options = [ft.DropdownOption(key=name, text=name) for name in names]
+        dropdown.disabled = not names
+        if dropdown.value not in names:
+            dropdown.value = self.default_profiles.get(language, "") if self.default_profiles.get(language, "") in names else (names[0] if names else "")
+
+    def _input_languages(self) -> list[str]:
+        if not self.spreadsheet:
+            return []
+        mapping = self.mapping or self.spreadsheet.inferred_mapping
+        rows = rows_from_mapping(self.spreadsheet.rows, mapping)
+        return languages_from_rows(rows)
 
     def _load_file(self, _event: Any) -> None:
         path = self.file_path.value.strip()
@@ -1093,8 +1255,9 @@ class ProfileCreatorApp:
             rows = rows_from_mapping(self.spreadsheet.rows, self.mapping or self.spreadsheet.inferred_mapping)
             strategy = parse_strategy(str(self.strategy_group.value or ""), ProfileStrategy.EXTEND_DEFAULT)
             service = WorkflowService(self.client)
-            parent_by_language = self._selected_profile_by_language(self.parent_dropdown.value or "")
-            copy_by_language = self._selected_profile_by_language(self.copy_dropdown.value or "")
+            languages = languages_from_rows(rows)
+            parent_by_language = selected_profiles_by_language(self._dropdown_values(self.parent_dropdowns), languages)
+            copy_by_language = selected_profiles_by_language(self._dropdown_values(self.copy_dropdowns), languages)
             self.precheck_result = service.precheck(
                 rows,
                 default_strategy=strategy,
@@ -1109,16 +1272,11 @@ class ProfileCreatorApp:
             self._set_status(self.precheck_status, str(exc), DANGER)
         finally:
             self._set_busy(False)
-            self.render()
+            if not self._exit_requested:
+                self.render()
 
-    def _selected_profile_by_language(self, profile_name: str) -> dict[str, str]:
-        if not profile_name:
-            return {}
-        result = {}
-        for language, profiles in self.available_profiles.items():
-            if profile_name in profiles:
-                result[language] = profile_name
-        return result
+    def _dropdown_values(self, controls: dict[str, ft.Dropdown]) -> dict[str, str]:
+        return {language: str(dropdown.value or "") for language, dropdown in controls.items()}
 
     def _apply_changes(self, _event: Any) -> None:
         self._run_background(self._apply_worker)
@@ -1137,7 +1295,8 @@ class ProfileCreatorApp:
             self._show_message(str(exc))
         finally:
             self._set_busy(False)
-            self.render()
+            if not self._exit_requested:
+                self.render()
 
     def _export_precheck(self, _event: Any) -> None:
         if not self.precheck_result:
@@ -1161,9 +1320,11 @@ class ProfileCreatorApp:
         self.render()
 
     def _confirm_exit(self, _event: Any) -> None:
+        if self._exit_requested:
+            return
         self.page.show_dialog(
             ft.AlertDialog(
-                title=ft.Text(self.t("exit_app"), weight=ft.FontWeight.BOLD, color=TEXT),
+                title=ft.Text(self.t("exit_app"), weight=WEIGHT_SEMIBOLD, color=TEXT),
                 content=ft.Text(self.t("exit_confirm"), color=TEXT_MUTED),
                 actions=[
                     ft.TextButton(self.t("cancel"), on_click=lambda _e: self.page.pop_dialog()),
@@ -1174,11 +1335,17 @@ class ProfileCreatorApp:
         )
         self.page.update()
 
+    def _on_window_event(self, event: ft.WindowEvent) -> None:
+        if event.type == ft.WindowEventType.CLOSE:
+            self._shutdown_app()
+
     def _on_connect(self, _event: Any) -> None:
         self._disconnect_token += 1
         self._connected = True
 
     def _on_disconnect(self, _event: Any) -> None:
+        if os.environ.get("SONARQUBE_PROFILE_CREATOR_VIEW") != "web":
+            return
         self._disconnect_token += 1
         self._connected = False
         token = self._disconnect_token
@@ -1191,26 +1358,41 @@ class ProfileCreatorApp:
         threading.Thread(target=delayed_exit, daemon=True).start()
 
     def _shutdown_app(self, _event: Any | None = None) -> None:
+        if self._exit_requested:
+            return
+        self._exit_requested = True
         try:
             self.page.pop_dialog()
         except Exception:
             pass
-        threading.Thread(target=_request_process_exit, daemon=True).start()
+        self.progress.visible = False
+        self.progress.value = 0
+        try:
+            self.page.update()
+        except Exception:
+            pass
+        _request_process_exit()
 
     def _set_busy(self, busy: bool) -> None:
+        if self._exit_requested:
+            return
         self.progress.visible = busy
         self.progress.value = None if busy else 0
         self.page.update()
 
     def _set_status(self, control: ft.Text, value: str, color: str) -> None:
+        if self._exit_requested:
+            return
         control.value = value
         control.color = color
         self.page.update()
 
     def _show_message(self, message: str) -> None:
+        if self._exit_requested:
+            return
         self.page.show_dialog(
             ft.AlertDialog(
-                title=ft.Text(self.t("app_title"), weight=ft.FontWeight.BOLD, color=TEXT),
+                title=ft.Text(self.t("app_title"), weight=WEIGHT_SEMIBOLD, color=TEXT),
                 content=ft.Text(message, color=TEXT_MUTED),
                 actions=[ft.TextButton("OK", on_click=lambda _e: self.page.pop_dialog())],
                 modal=False,
@@ -1227,13 +1409,30 @@ def app(page: ft.Page) -> None:
     ProfileCreatorApp(page).run()
 
 
+def languages_from_rows(rows: Iterable[RuleRow]) -> list[str]:
+    return sorted({row.language for row in rows if row.language})
+
+
+def selected_profiles_by_language(values: dict[str, str], languages: Iterable[str]) -> dict[str, str]:
+    language_set = set(languages)
+    return {language: profile for language, profile in values.items() if language in language_set and profile}
+
+
 def _request_process_exit() -> None:
-    time.sleep(0.2)
     _clear_instance_file()
-    try:
-        os.kill(os.getpid(), signal.SIGTERM)
-    except Exception:
-        os._exit(0)
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(os.getpid()), "/T", "/F"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            pass
+    os._exit(0)
 
 
 def _clear_instance_file() -> None:
@@ -1267,3 +1466,4 @@ def _soft_for_color(color: str) -> str:
     if color in (PRIMARY, PRIMARY_DARK):
         return PRIMARY_SOFT
     return NEUTRAL_SOFT
+

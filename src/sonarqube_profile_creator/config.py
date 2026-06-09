@@ -9,6 +9,7 @@ import keyring
 
 
 APP_NAME = "SonarQubeProfileCreator"
+APP_DISPLAY_NAME = "SonarQube Profile Creator"
 TOKEN_SERVICE = "sonarqube-profile-creator"
 
 
@@ -17,6 +18,13 @@ def user_config_dir() -> Path:
     if base:
         return Path(base) / APP_NAME
     return Path.home() / ".sonarqube-profile-creator"
+
+
+def local_cache_dir() -> Path:
+    base = os.environ.get("LOCALAPPDATA")
+    if base:
+        return Path(base) / APP_NAME
+    return user_config_dir() / "cache"
 
 
 @dataclass
@@ -83,4 +91,3 @@ def reports_dir() -> Path:
     path = user_config_dir() / "reports"
     path.mkdir(parents=True, exist_ok=True)
     return path
-

@@ -25,13 +25,13 @@ $env:PYTHONPATH = "src"
 python -m sonarqube_profile_creator.main
 ```
 
-The packaged EXE opens the app in the default browser at a local address. Startup logs are written to `%APPDATA%\SonarQubeProfileCreator\startup.log`.
+The app opens in a Flet Desktop window by default. Startup logs are written to `%APPDATA%\SonarQubeProfileCreator\startup.log`.
 
-To use the Flet desktop client while developing:
+To use browser mode while developing:
 
 ```powershell
 $env:PYTHONPATH = "src"
-python -m sonarqube_profile_creator.main --desktop
+python -m sonarqube_profile_creator.main --web
 ```
 
 ## Create Example Templates
@@ -68,4 +68,4 @@ python -m pip install -r requirements-dev.txt
 powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 ```
 
-The generated app is placed under `dist\SonarQubeProfileCreator`.
+The generated single-file app is placed at `dist\SonarQubeProfileCreator.exe`.

@@ -20,7 +20,6 @@ from .sonarqube import SonarQubeClient, SonarQubeError
 VALID_SEVERITIES = {"INFO", "MINOR", "MAJOR", "CRITICAL", "BLOCKER", ""}
 TRUE_VALUES = {"true", "yes", "y", "1", "是", "是的"}
 STRATEGY_ALIASES = {
-    "": ProfileStrategy.EXTEND_DEFAULT,
     "extend_default": ProfileStrategy.EXTEND_DEFAULT,
     "default": ProfileStrategy.EXTEND_DEFAULT,
     "默认继承": ProfileStrategy.EXTEND_DEFAULT,
@@ -71,6 +70,7 @@ class WorkflowService:
                             suggestion="The rule will be processed once.",
                         )
                     )
+                    continue
                 seen_rows.add(marker)
                 normalized_rows.append(row)
 
@@ -179,6 +179,7 @@ class WorkflowService:
             return ApplyResult(precheck=precheck, actions=actions)
 
         profile_keys: dict[tuple[str, str], str] = {}
+        failed_profiles: set[tuple[str, str]] = set()
         for plan in precheck.profile_plans:
             existing = self.client.get_profile_by_name(plan.language, plan.target_profile)
             try:
@@ -224,6 +225,8 @@ class WorkflowService:
                     )
             except SonarQubeError as exc:
                 actions.append(self._api_error("profile_create", exc, plan.language, plan.target_profile))
+                failed_profiles.add(plan.key)
+                actions.append(self._profile_skipped(plan))
                 continue
 
             if plan.strategy in {ProfileStrategy.EXTEND_DEFAULT, ProfileStrategy.EXTEND_SELECTED}:
@@ -241,6 +244,9 @@ class WorkflowService:
                     )
                 except SonarQubeError as exc:
                     actions.append(self._api_error("change_parent", exc, plan.language, plan.target_profile))
+                    failed_profiles.add(plan.key)
+                    actions.append(self._profile_skipped(plan))
+                    continue
 
             for project_key in plan.project_keys:
                 try:
@@ -300,6 +306,21 @@ class WorkflowService:
                     )
 
         for row in precheck.rows:
+            profile_key_tuple = (row.language, row.target_profile)
+            if profile_key_tuple in failed_profiles:
+                actions.append(
+                    ActionResult(
+                        status=ItemStatus.SKIPPED,
+                        action="rule_activation_skipped",
+                        message="Rule activation skipped because profile setup failed.",
+                        language=row.language,
+                        profile=row.target_profile,
+                        rule_key=row.rule_key,
+                        source_row=row.source_row,
+                        suggestion="Fix earlier profile setup errors and run again.",
+                    )
+                )
+                continue
             profile_key = profile_keys.get((row.language, row.target_profile))
             if not profile_key:
                 actions.append(
@@ -362,6 +383,16 @@ class WorkflowService:
                     )
 
         return ApplyResult(precheck=precheck, actions=actions)
+
+    def _profile_skipped(self, plan: ProfilePlan) -> ActionResult:
+        return ActionResult(
+            status=ItemStatus.SKIPPED,
+            action="profile_followup_skipped",
+            message="Project binding, default setting, backup export, and rule activation skipped because profile setup failed.",
+            language=plan.language,
+            profile=plan.target_profile,
+            suggestion="Fix earlier profile setup errors and run again.",
+        )
 
     def _validate_row(self, row: RuleRow) -> list[ValidationIssue]:
         issues: list[ValidationIssue] = []
@@ -521,6 +552,8 @@ class WorkflowService:
 
 def parse_strategy(value: str, default: ProfileStrategy = ProfileStrategy.EXTEND_DEFAULT) -> ProfileStrategy:
     text = (value or "").strip().casefold()
+    if not text:
+        return default
     return STRATEGY_ALIASES.get(text, default)
 
 
@@ -530,4 +563,3 @@ def parse_bool(value: str) -> bool:
 
 def _safe_name(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in value).strip("_") or "profile"
-

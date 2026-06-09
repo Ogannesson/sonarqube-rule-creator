@@ -6,6 +6,8 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "flet>=0.85.2",
+    "flet-desktop>=0.85.2",
+    "flet-web>=0.85.2",
     "requests>=2.33.1",
     "openpyxl>=3.1.5",
     "keyring>=25.7.0",
@@ -14,9 +16,11 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=9.0.3",
+    "pillow>=12.2.0",
 ]
 build = [
     "pyinstaller>=6.16.0",
+    "pillow>=12.2.0",
 ]
 
 [project.scripts]
@@ -25,4 +29,3 @@ sonarqube-profile-creator = "sonarqube_profile_creator.main:main"
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
-

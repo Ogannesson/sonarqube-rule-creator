@@ -69,3 +69,13 @@ powershell -ExecutionPolicy Bypass -File scripts\build_windows.ps1
 ```
 
 The generated single-file app is placed at `dist\SonarQubeProfileCreator.exe`.
+
+## Release
+
+GitHub Actions runs tests on `main` and pull requests. Version tags build the Windows EXE and publish a GitHub Release.
+
+```powershell
+git tag v1.0.0
+git push origin main
+git push origin v1.0.0
+```

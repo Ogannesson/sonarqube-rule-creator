@@ -1,0 +1,28 @@
+[project]
+name = "sonarqube-profile-creator"
+version = "0.1.0"
+description = "Desktop app for creating SonarQube Quality Profiles from CSV/XLSX rule lists."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "flet>=0.85.2",
+    "requests>=2.33.1",
+    "openpyxl>=3.1.5",
+    "keyring>=25.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.3",
+]
+build = [
+    "pyinstaller>=6.16.0",
+]
+
+[project.scripts]
+sonarqube-profile-creator = "sonarqube_profile_creator.main:main"
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+

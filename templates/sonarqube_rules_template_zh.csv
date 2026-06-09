@@ -1,0 +1,4 @@
+语言,目标Profile,规则Key,父Profile,策略,严重级别,规则参数,优先规则,项目Key,设为默认
+java,PM演示Java配置,java:S1144,,默认继承,MAJOR,,否,,否
+js,PM演示JS配置,javascript:S1128,,默认继承,,,否,,否
+

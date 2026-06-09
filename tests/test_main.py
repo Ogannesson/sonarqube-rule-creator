@@ -33,6 +33,7 @@ def test_desktop_window_uses_display_name(monkeypatch):
         calls.append(kwargs)
 
     monkeypatch.setattr("sonarqube_profile_creator.main.ft.run", fake_run)
+    monkeypatch.setattr("sonarqube_profile_creator.main._prepare_flet_desktop_runtime", lambda: None)
 
     _run_flet_app(ft.AppView.FLET_APP)
 
@@ -54,9 +55,8 @@ def test_prepare_flet_runtime_uses_local_cache(monkeypatch, tmp_path):
     monkeypatch.delenv("FLET_VIEW_PATH", raising=False)
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
     monkeypatch.setattr("sonarqube_profile_creator.main.os.name", "nt")
-    monkeypatch.setattr("sonarqube_profile_creator.main.flet_desktop.version.version", "0.85.2")
-    monkeypatch.setattr("sonarqube_profile_creator.main.flet_desktop.get_package_bin_dir", lambda: str(tmp_path))
-    monkeypatch.setattr("sonarqube_profile_creator.main.flet_desktop.get_artifact_filename", lambda: archive_path.name)
+    monkeypatch.setattr("sonarqube_profile_creator.main._flet_desktop_version", lambda: "0.85.2")
+    monkeypatch.setattr("sonarqube_profile_creator.main._flet_desktop_archive_path", lambda: archive_path)
     monkeypatch.setattr("sonarqube_profile_creator.main._file_fingerprint", lambda _path: "iconhash")
     monkeypatch.setattr("sonarqube_profile_creator.main._copy_icon_to_flet_view", lambda _exe, _icon: True)
 

@@ -17,8 +17,6 @@ from pathlib import Path
 from typing import TextIO
 
 import flet as ft
-import flet_desktop
-import flet_desktop.version
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -112,7 +110,7 @@ def _prepare_flet_desktop_runtime() -> Path | None:
     if os.name != "nt":
         return None
 
-    version = flet_desktop.version.version
+    version = _flet_desktop_version()
     cache_root = local_cache_dir() / "flet"
     icon_path = _assets_dir() / "app_icon.ico"
     icon_fingerprint = _file_fingerprint(icon_path)
@@ -129,7 +127,7 @@ def _prepare_flet_desktop_runtime() -> Path | None:
     _clear_stale_flet_runtime_dirs(cache_root, f"flet-desktop-full-{version}", keep=runtime_dir)
     shutil.rmtree(runtime_dir, ignore_errors=True)
 
-    archive_path = Path(flet_desktop.get_package_bin_dir()) / flet_desktop.get_artifact_filename()
+    archive_path = _flet_desktop_archive_path()
     if not archive_path.exists():
         return None
 
@@ -147,6 +145,18 @@ def _prepare_flet_desktop_runtime() -> Path | None:
 
     os.environ["FLET_VIEW_PATH"] = str(flet_exe.parent)
     return runtime_dir
+
+
+def _flet_desktop_version() -> str:
+    import flet_desktop.version
+
+    return str(flet_desktop.version.version)
+
+
+def _flet_desktop_archive_path() -> Path:
+    import flet_desktop
+
+    return Path(flet_desktop.get_package_bin_dir()) / flet_desktop.get_artifact_filename()
 
 
 def _clear_stale_flet_runtime_dirs(cache_root: Path, runtime_name: str, keep: Path | None = None) -> None:

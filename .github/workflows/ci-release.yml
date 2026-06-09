@@ -37,7 +37,19 @@ jobs:
       - name: Run tests
         env:
           PYTHONPATH: src
-        run: python -m pytest -q
+        run: |
+          python -m pytest -q 2>&1 | tee pytest.log
+          test ${PIPESTATUS[0]} -eq 0
+
+      - name: Publish test output
+        if: always()
+        run: |
+          {
+            echo "### Pytest output"
+            echo '```text'
+            tail -n 120 pytest.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
 
   release:
     name: Build Windows Release

@@ -54,7 +54,7 @@ def test_prepare_flet_runtime_uses_local_cache(monkeypatch, tmp_path):
 
     monkeypatch.delenv("FLET_VIEW_PATH", raising=False)
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
-    monkeypatch.setattr("sonarqube_profile_creator.main.os.name", "nt")
+    monkeypatch.setattr("sonarqube_profile_creator.main._is_windows", lambda: True)
     monkeypatch.setattr("sonarqube_profile_creator.main._flet_desktop_version", lambda: "0.85.2")
     monkeypatch.setattr("sonarqube_profile_creator.main._flet_desktop_archive_path", lambda: archive_path)
     monkeypatch.setattr("sonarqube_profile_creator.main._file_fingerprint", lambda _path: "iconhash")

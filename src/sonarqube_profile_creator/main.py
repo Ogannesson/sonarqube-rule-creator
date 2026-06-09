@@ -107,7 +107,7 @@ def _assets_dir() -> Path:
 def _prepare_flet_desktop_runtime() -> Path | None:
     if os.environ.get("FLET_VIEW_PATH"):
         return None
-    if os.name != "nt":
+    if not _is_windows():
         return None
 
     version = _flet_desktop_version()
@@ -157,6 +157,10 @@ def _flet_desktop_archive_path() -> Path:
     import flet_desktop
 
     return Path(flet_desktop.get_package_bin_dir()) / flet_desktop.get_artifact_filename()
+
+
+def _is_windows() -> bool:
+    return os.name == "nt"
 
 
 def _clear_stale_flet_runtime_dirs(cache_root: Path, runtime_name: str, keep: Path | None = None) -> None:
@@ -291,7 +295,7 @@ def _clear_instance(_expected_url: str = "") -> None:
 def _is_pid_running(pid: int) -> bool:
     if pid <= 0:
         return False
-    if os.name == "nt":
+    if _is_windows():
         process_query_limited_information = 0x1000
         still_active = 259
         kernel32 = ctypes.windll.kernel32

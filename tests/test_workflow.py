@@ -173,3 +173,17 @@ def test_apply_parent_failure_skips_profile_followups_and_rule_activation(tmp_pa
     assert "set_default" not in call_names
     assert "backup_profile" not in call_names
     assert "activate_rule" not in call_names
+
+
+def test_apply_active_false_skips_rule_activation(tmp_path):
+    client = FakeClient()
+    rows = [
+        RuleRow(source_row=2, language="java", target_profile="Demo", rule_key="java:S1144", active="false"),
+    ]
+    precheck = WorkflowService(client).precheck(rows, default_strategy=ProfileStrategy.INDEPENDENT)
+
+    result = WorkflowService(client).apply(precheck, backup_dir=tmp_path)
+
+    assert any(action.action == "rule_activation_skipped" and action.status == ItemStatus.SKIPPED for action in result.actions)
+    assert "java:S1144" not in precheck.rule_status
+    assert "activate_rule" not in [call[0] for call in client.calls]

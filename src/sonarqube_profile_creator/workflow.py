@@ -129,7 +129,7 @@ class WorkflowService:
                     )
 
         rule_status: dict[str, ItemStatus] = {}
-        for rule_key in sorted({row.rule_key for row in normalized_rows if row.rule_key}):
+        for rule_key in sorted({row.rule_key for row in normalized_rows if row.rule_key and _row_active(row)}):
             try:
                 rule = self.client.search_rule(rule_key)
             except SonarQubeError as exc:
@@ -306,6 +306,19 @@ class WorkflowService:
                     )
 
         for row in precheck.rows:
+            if not _row_active(row):
+                actions.append(
+                    ActionResult(
+                        status=ItemStatus.SKIPPED,
+                        action="rule_activation_skipped",
+                        message="Rule activation skipped because active is false.",
+                        language=row.language,
+                        profile=row.target_profile,
+                        rule_key=row.rule_key,
+                        source_row=row.source_row,
+                    )
+                )
+                continue
             profile_key_tuple = (row.language, row.target_profile)
             if profile_key_tuple in failed_profiles:
                 actions.append(
@@ -559,6 +572,10 @@ def parse_strategy(value: str, default: ProfileStrategy = ProfileStrategy.EXTEND
 
 def parse_bool(value: str) -> bool:
     return (value or "").strip().casefold() in TRUE_VALUES
+
+
+def _row_active(row: RuleRow) -> bool:
+    return True if row.active == "" else parse_bool(row.active)
 
 
 def _safe_name(value: str) -> str:

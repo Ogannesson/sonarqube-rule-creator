@@ -1,7 +1,7 @@
 import asyncio
 
 from sonarqube_profile_creator import gui
-from sonarqube_profile_creator.gui import languages_from_rows, selected_profiles_by_language
+from sonarqube_profile_creator.gui import languages_from_rows, selected_profiles_by_language, target_profile_for_language
 from sonarqube_profile_creator.models import RuleRow
 
 
@@ -22,6 +22,26 @@ def test_selected_profiles_by_language_filters_to_input_languages():
     result = selected_profiles_by_language(values, ["java", "js", "cpp"])
 
     assert result == {"java": "Base Java", "js": "Base JS"}
+
+
+def test_target_profile_for_language_returns_single_target():
+    rows = [
+        RuleRow(source_row=2, language="java", target_profile="Demo", rule_key="java:S1144"),
+        RuleRow(source_row=3, language="java", target_profile="Demo", rule_key="java:S112"),
+        RuleRow(source_row=4, language="js", target_profile="JsDemo", rule_key="javascript:S1128"),
+    ]
+
+    assert target_profile_for_language(rows, "java") == "Demo"
+    assert target_profile_for_language(rows, "js") == "JsDemo"
+
+
+def test_target_profile_for_language_returns_empty_for_multiple_targets():
+    rows = [
+        RuleRow(source_row=2, language="java", target_profile="Demo", rule_key="java:S1144"),
+        RuleRow(source_row=3, language="java", target_profile="Other", rule_key="java:S112"),
+    ]
+
+    assert target_profile_for_language(rows, "java") == ""
 
 
 def test_desktop_disconnect_does_not_start_exit_thread(monkeypatch):
@@ -191,3 +211,18 @@ def test_strategy_change_updates_detail_without_full_render():
         ("refresh_detail", None),
         ("detail_update", None),
     ]
+
+
+def test_open_report_folder_uses_sync_result(monkeypatch, tmp_path):
+    calls = []
+    report = tmp_path / "sync_report.xlsx"
+    report.write_text("", encoding="utf-8")
+
+    app = object.__new__(gui.ProfileCreatorApp)
+    app.apply_result = None
+    app.sync_result = type("SyncResult", (), {"report_xlsx": report})()
+    monkeypatch.setattr(gui.os, "startfile", lambda folder: calls.append(folder), raising=False)
+
+    gui.ProfileCreatorApp._open_report_folder(app, None)
+
+    assert calls == [str(tmp_path)]

@@ -5,11 +5,32 @@ from pathlib import Path
 from typing import Any
 
 from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Font, PatternFill
+from openpyxl.utils import get_column_letter
 
-from .models import ALL_FIELDS, FieldMapping, REQUIRED_FIELDS, RuleRow, SpreadsheetData
+from .models import ALL_FIELDS, FieldMapping, ProfileRuleRow, REQUIRED_FIELDS, RuleRow, SpreadsheetData
+
+
+PROFILE_RULE_FIELDS = (
+    "source_row",
+    "language",
+    "target_profile",
+    "profile_key",
+    "source_profile",
+    "rule_key",
+    "rule_name",
+    "active",
+    "severity",
+    "params",
+    "prioritizedRule",
+    "inheritance",
+    "sync_action",
+    "note",
+)
 
 
 HEADER_ALIASES: dict[str, set[str]] = {
+    "source_row": {"source_row", "source row", "row", "行号"},
     "language": {"language", "lang", "语言", "语言key", "语言 key", "sonar语言"},
     "target_profile": {
         "target_profile",
@@ -33,6 +54,12 @@ HEADER_ALIASES: dict[str, set[str]] = {
         "继承 profile",
     },
     "strategy": {"strategy", "profile_strategy", "策略", "profile策略", "profile 策略"},
+    "active": {"active", "enabled", "启用", "是否启用", "激活"},
+    "sync_action": {"sync_action", "sync action", "action", "同步动作", "动作"},
+    "source_profile": {"source_profile", "source profile", "源profile", "源 profile"},
+    "profile_key": {"profile_key", "profile key", "qprofile", "profile id"},
+    "rule_name": {"rule_name", "rule name", "name", "规则名称"},
+    "inheritance": {"inheritance", "继承状态", "继承"},
     "severity": {"severity", "严重级别", "严重性", "级别"},
     "params": {"params", "parameters", "rule_params", "规则参数", "参数"},
     "prioritizedRule": {
@@ -44,6 +71,7 @@ HEADER_ALIASES: dict[str, set[str]] = {
     },
     "project_key": {"project_key", "project key", "project", "项目key", "项目 key", "项目"},
     "set_default": {"set_default", "set default", "default", "设为默认", "默认profile"},
+    "note": {"note", "notes", "备注", "说明"},
 }
 
 
@@ -55,7 +83,7 @@ def normalize_header(value: object) -> str:
 def infer_mapping(headers: list[str]) -> FieldMapping:
     normalized = {normalize_header(header): header for header in headers}
     columns: dict[str, str] = {}
-    for field in ALL_FIELDS:
+    for field in dict.fromkeys((*ALL_FIELDS, *PROFILE_RULE_FIELDS)):
         for alias in HEADER_ALIASES.get(field, set()):
             key = normalize_header(alias)
             if key in normalized:
@@ -135,15 +163,73 @@ def rows_from_mapping(rows: list[dict[str, Any]], mapping: FieldMapping) -> list
                 rule_key=payload["rule_key"],
                 parent_profile=payload["parent_profile"],
                 strategy=payload["strategy"],
+                active=payload["active"],
+                sync_action=payload["sync_action"],
+                source_profile=payload["source_profile"],
+                profile_key=payload["profile_key"],
+                rule_name=payload["rule_name"],
+                inheritance=payload["inheritance"],
                 severity=payload["severity"],
                 params=payload["params"],
                 prioritizedRule=payload["prioritizedRule"],
                 project_key=payload["project_key"],
                 set_default=payload["set_default"],
+                note=payload["note"],
                 raw=raw,
             )
         )
     return mapped
+
+
+def profile_rule_rows_from_mapping(rows: list[dict[str, Any]], mapping: FieldMapping) -> list[ProfileRuleRow]:
+    mapped: list[ProfileRuleRow] = []
+    for index, raw in enumerate(rows, start=2):
+        payload = {}
+        for field in PROFILE_RULE_FIELDS:
+            source = mapping.source_for(field)
+            payload[field] = _clean_value(raw.get(source, "")) if source else ""
+        mapped.append(
+            ProfileRuleRow(
+                source_row=int(payload["source_row"] or index),
+                language=payload["language"],
+                target_profile=payload["target_profile"],
+                profile_key=payload["profile_key"],
+                source_profile=payload["source_profile"],
+                rule_key=payload["rule_key"],
+                rule_name=payload["rule_name"],
+                active=payload["active"] or "true",
+                severity=payload["severity"],
+                params=payload["params"],
+                prioritizedRule=payload["prioritizedRule"],
+                inheritance=payload["inheritance"],
+                sync_action=payload["sync_action"],
+                note=payload["note"],
+                raw=raw,
+            )
+        )
+    return mapped
+
+
+def write_profile_rules(output_dir: str | Path, rows: list[ProfileRuleRow], name: str = "profile_rules") -> tuple[Path, Path]:
+    path = Path(output_dir)
+    path.mkdir(parents=True, exist_ok=True)
+    csv_path = path / f"{name}.csv"
+    xlsx_path = path / f"{name}.xlsx"
+    payloads = [_profile_rule_payload(row) for row in rows]
+    with csv_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(PROFILE_RULE_FIELDS))
+        writer.writeheader()
+        writer.writerows(payloads)
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Profile Rules"
+    sheet.append(list(PROFILE_RULE_FIELDS))
+    for payload in payloads:
+        sheet.append([payload[field] for field in PROFILE_RULE_FIELDS])
+    _style_sheet(sheet)
+    workbook.save(xlsx_path)
+    return csv_path, xlsx_path
 
 
 def validate_required_mapping(mapping: FieldMapping) -> list[str]:
@@ -198,3 +284,39 @@ def write_example_templates(output_dir: str | Path) -> tuple[Path, Path]:
     workbook.save(xlsx_path)
     return csv_path, xlsx_path
 
+
+def _profile_rule_payload(row: ProfileRuleRow) -> dict[str, Any]:
+    return {
+        "source_row": row.source_row,
+        "language": row.language,
+        "target_profile": row.target_profile,
+        "profile_key": row.profile_key,
+        "source_profile": row.source_profile,
+        "rule_key": row.rule_key,
+        "rule_name": row.rule_name,
+        "active": row.active,
+        "severity": row.severity,
+        "params": row.params,
+        "prioritizedRule": row.prioritizedRule,
+        "inheritance": row.inheritance,
+        "sync_action": row.sync_action,
+        "note": row.note,
+    }
+
+
+def _style_sheet(sheet) -> None:
+    header_fill = PatternFill("solid", fgColor="1F4E79")
+    header_font = Font(bold=True, color="FFFFFF")
+    for cell in sheet[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(vertical="center")
+    sheet.freeze_panes = "A2"
+    for column in sheet.columns:
+        max_length = 0
+        letter = get_column_letter(column[0].column)
+        for cell in column:
+            value = str(cell.value or "")
+            max_length = max(max_length, len(value))
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+        sheet.column_dimensions[letter].width = min(max(max_length + 2, 12), 52)

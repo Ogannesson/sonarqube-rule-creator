@@ -101,6 +101,37 @@ class SonarQubeClient:
             return rules[0]
         return None
 
+    def search_active_rules(self, profile_key: str) -> list[dict[str, Any]]:
+        rules: list[dict[str, Any]] = []
+        page = 1
+        page_size = 500
+        while True:
+            payload = self.get(
+                "api/rules/search",
+                params={
+                    "qprofile": profile_key,
+                    "activation": "true",
+                    "p": page,
+                    "ps": page_size,
+                },
+            )
+            batch = list(payload.get("rules", []))
+            rules.extend(batch)
+            paging = payload.get("paging", {})
+            total = int(paging.get("total", len(rules)) or 0)
+            if len(rules) >= total or not batch:
+                return rules
+            page += 1
+
+    def show_rule_activation(self, rule_key: str, profile_key: str) -> dict[str, Any]:
+        payload = self.show_rule(rule_key, actives=True) or {}
+        actives = payload.get("actives", [])
+        for active in actives:
+            active_profile_key = str(active.get("qProfile") or active.get("qProfileKey") or active.get("profileKey") or "")
+            if active_profile_key == profile_key:
+                return dict(active)
+        return {}
+
     def activate_rule(
         self,
         profile_key: str,
@@ -117,6 +148,9 @@ class SonarQubeClient:
         if prioritized_rule:
             data["prioritizedRule"] = prioritized_rule
         return self.post("api/qualityprofiles/activate_rule", data=data)
+
+    def deactivate_rule(self, profile_key: str, rule_key: str) -> dict[str, Any]:
+        return self.post("api/qualityprofiles/deactivate_rule", data={"key": profile_key, "rule": rule_key})
 
     def add_project(self, language: str, project_key: str, quality_profile: str) -> dict[str, Any]:
         return self.post(
@@ -207,6 +241,7 @@ class SonarQubeClient:
             "change_parent": ("api/qualityprofiles", "change_parent"),
             "copy_profile": ("api/qualityprofiles", "copy"),
             "activate_rule": ("api/qualityprofiles", "activate_rule"),
+            "deactivate_rule": ("api/qualityprofiles", "deactivate_rule"),
             "add_project": ("api/qualityprofiles", "add_project"),
             "set_default": ("api/qualityprofiles", "set_default"),
             "backup": ("api/qualityprofiles", "backup"),
@@ -225,4 +260,3 @@ class SonarQubeClient:
 def basic_auth_header(token: str) -> str:
     encoded = base64.b64encode(f"{token}:".encode("utf-8")).decode("ascii")
     return f"Basic {encoded}"
-

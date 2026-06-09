@@ -12,10 +12,11 @@ import flet as ft
 
 from .config import APP_DISPLAY_NAME, AppConfig, ConfigStore, reports_dir, user_config_dir
 from .i18n import Translator, detect_language
-from .models import ALL_FIELDS, FieldMapping, ItemStatus, ProfileStrategy, RuleRow, SpreadsheetData
-from .reports import export_apply_report, export_precheck_report
+from .models import ALL_FIELDS, FieldMapping, ItemStatus, ProfileSyncMode, ProfileStrategy, RuleRow, SpreadsheetData
+from .profile_sync import ProfileExportService, ProfileSyncService
+from .reports import export_apply_report, export_precheck_report, export_sync_precheck_report, export_sync_report
 from .sonarqube import ConnectionInfo, SonarQubeClient, SonarQubeError
-from .spreadsheet import read_spreadsheet, rows_from_mapping, validate_required_mapping
+from .spreadsheet import profile_rule_rows_from_mapping, read_spreadsheet, rows_from_mapping, validate_required_mapping
 from .workflow import WorkflowService, parse_strategy
 
 
@@ -60,6 +61,8 @@ class ProfileCreatorApp:
         self.mapping: FieldMapping | None = None
         self.precheck_result = None
         self.apply_result = None
+        self.sync_plan = None
+        self.sync_result = None
         self.available_profiles: dict[str, list[str]] = {}
         self.default_profiles: dict[str, str] = {}
 
@@ -114,6 +117,21 @@ class ProfileCreatorApp:
         self.strategy_detail = ft.Column([], spacing=8)
         self.parent_dropdowns: dict[str, ft.Dropdown] = {}
         self.copy_dropdowns: dict[str, ft.Dropdown] = {}
+        self.export_language = ft.Dropdown(label=self.t("export_language"), width=180, enable_search=True, border_color=LINE, focused_border_color=PRIMARY, border_radius=6)
+        self.export_profile = ft.Dropdown(label=self.t("export_profile"), width=360, enable_search=True, border_color=LINE, focused_border_color=PRIMARY, border_radius=6)
+        self.sync_mode = ft.Dropdown(
+            label=self.t("sync_mode"),
+            value=ProfileSyncMode.PATCH.value,
+            width=180,
+            options=[
+                ft.DropdownOption(key=ProfileSyncMode.PATCH.value, text=self.t("sync_mode_patch")),
+                ft.DropdownOption(key=ProfileSyncMode.REPLACE.value, text=self.t("sync_mode_replace")),
+            ],
+            border_color=LINE,
+            focused_border_color=PRIMARY,
+            border_radius=6,
+        )
+        self.sync_status = ft.Text("", color=TEXT_MUTED)
         self.precheck_status = ft.Text("", color=TEXT_MUTED)
         self.progress = ft.ProgressBar(visible=False, color=PRIMARY, bgcolor=PRIMARY_SOFT)
         self.main_area = ft.Column([], expand=True, scroll=ft.ScrollMode.AUTO)
@@ -157,7 +175,15 @@ class ProfileCreatorApp:
         self.token.label = self.t("token")
         self.remember_token.label = self.t("remember_token")
         self.file_path.label = self.t("selected_file")
+        self.export_language.label = self.t("export_language")
+        self.export_profile.label = self.t("export_profile")
+        self.sync_mode.label = self.t("sync_mode")
+        self.sync_mode.options = [
+            ft.DropdownOption(key=ProfileSyncMode.PATCH.value, text=self.t("sync_mode_patch")),
+            ft.DropdownOption(key=ProfileSyncMode.REPLACE.value, text=self.t("sync_mode_replace")),
+        ]
         self._refresh_strategy_options()
+        self._refresh_export_controls()
 
         self.page.add(
             ft.Stack(
@@ -348,6 +374,7 @@ class ProfileCreatorApp:
                             [
                                 self._connect_panel(),
                                 self._import_panel(),
+                                self._profile_sync_panel(),
                                 self._strategy_panel(),
                                 self._precheck_panel(),
                                 self._apply_panel(),
@@ -568,6 +595,44 @@ class ProfileCreatorApp:
             ),
         )
 
+    def _profile_sync_panel(self) -> ft.Control:
+        disabled = not self.client
+        apply_disabled = not (self.sync_plan and self.sync_plan.can_apply)
+        return self._section(
+            self.t("profile_sync"),
+            self.t("desc_profile_sync"),
+            ft.Icons.SYNC_ALT,
+            ft.Column(
+                [
+                    ft.Row(
+                        [
+                            self.export_language,
+                            self.export_profile,
+                            ft.OutlinedButton(self.t("export_profile_rules"), icon=ft.Icons.DOWNLOAD, disabled=disabled, on_click=self._export_selected_profile, height=44),
+                        ],
+                        wrap=True,
+                        spacing=10,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    ft.Row(
+                        [
+                            self.sync_mode,
+                            ft.OutlinedButton(self.t("run_sync_precheck"), icon=ft.Icons.FACT_CHECK, disabled=disabled or not self.spreadsheet, on_click=self._run_sync_precheck, height=44),
+                            ft.FilledButton(self.t("apply_sync"), icon=ft.Icons.SYNC, disabled=apply_disabled, on_click=self._apply_sync, height=44),
+                            ft.OutlinedButton(self.t("export_report"), icon=ft.Icons.SIM_CARD_DOWNLOAD, disabled=self.sync_plan is None, on_click=self._export_sync_precheck, height=44),
+                        ],
+                        wrap=True,
+                        spacing=10,
+                        vertical_alignment=ft.CrossAxisAlignment.CENTER,
+                    ),
+                    self._inline_status(self.sync_status.value or self.t("sync_waiting"), self.sync_status.color or TEXT_MUTED),
+                    self._sync_summary(),
+                    self._sync_actions_table(),
+                ],
+                spacing=10,
+            ),
+        )
+
     def _strategy_detail_control(self) -> ft.Control:
         parent_controls: list[ft.Control] = []
         if self.strategy_group.value == ProfileStrategy.EXTEND_SELECTED.value:
@@ -642,6 +707,8 @@ class ProfileCreatorApp:
         report_text = ""
         if self.apply_result and self.apply_result.report_xlsx:
             report_text = str(self.apply_result.report_xlsx)
+        elif self.sync_result and self.sync_result.report_xlsx:
+            report_text = str(self.sync_result.report_xlsx)
         return self._section(
             self.t("step_report"),
             self.t("desc_report"),
@@ -811,6 +878,27 @@ class ProfileCreatorApp:
             spacing=10,
         )
 
+    def _sync_summary(self) -> ft.Control:
+        if not self.sync_plan:
+            return self._empty_state(self.t("sync_empty"), ft.Icons.SYNC_ALT)
+        errors = sum(1 for issue in self.sync_plan.issues if issue.status == ItemStatus.ERROR)
+        warnings = sum(1 for issue in self.sync_plan.issues if issue.status == ItemStatus.WARNING)
+        activate = sum(1 for action in self.sync_plan.actions if action.action == "activate")
+        update = sum(1 for action in self.sync_plan.actions if action.action == "update")
+        deactivate = sum(1 for action in self.sync_plan.actions if action.action == "deactivate")
+        return ft.Row(
+            [
+                self._metric(self.t("table_rows"), str(len(self.sync_plan.rows)), PRIMARY, ft.Icons.TABLE_ROWS),
+                self._metric(self.t("sync_activate"), str(activate), SUCCESS, ft.Icons.ADD_CIRCLE),
+                self._metric(self.t("sync_update"), str(update), PRIMARY_DARK, ft.Icons.UPDATE),
+                self._metric(self.t("sync_deactivate"), str(deactivate), WARNING, ft.Icons.REMOVE_CIRCLE),
+                self._metric(self.t("errors"), str(errors), DANGER, ft.Icons.ERROR_OUTLINE),
+                self._metric(self.t("warnings"), str(warnings), WARNING, ft.Icons.WARNING_AMBER),
+            ],
+            wrap=True,
+            spacing=10,
+        )
+
     def _metric(self, label: str, value: str, color: str, icon: str = ft.Icons.INSIGHTS) -> ft.Control:
         return ft.Container(
             content=ft.Row(
@@ -895,6 +983,46 @@ class ProfileCreatorApp:
             )
         return self._table_block(
             self.t("details"),
+            ft.DataTable(
+                columns=[
+                    ft.DataColumn(ft.Text("status", size=12, weight=WEIGHT_SEMIBOLD)),
+                    ft.DataColumn(ft.Text("action", size=12, weight=WEIGHT_SEMIBOLD)),
+                    ft.DataColumn(ft.Text("language", size=12, weight=WEIGHT_SEMIBOLD)),
+                    ft.DataColumn(ft.Text("profile", size=12, weight=WEIGHT_SEMIBOLD)),
+                    ft.DataColumn(ft.Text("rule", size=12, weight=WEIGHT_SEMIBOLD)),
+                    ft.DataColumn(ft.Text("message", size=12, weight=WEIGHT_SEMIBOLD)),
+                ],
+                rows=rows,
+                heading_row_color=SURFACE_MUTED,
+                column_spacing=16,
+                divider_thickness=1,
+            ),
+        )
+
+    def _sync_actions_table(self) -> ft.Control:
+        actions = []
+        if self.sync_result and self.sync_result.actions:
+            actions = self.sync_result.actions
+        elif self.sync_plan:
+            actions = self.sync_plan.actions
+        if not actions:
+            return ft.Text("")
+        rows = []
+        for action in actions[:100]:
+            rows.append(
+                ft.DataRow(
+                    cells=[
+                        ft.DataCell(self._status_badge(action.status.value)),
+                        ft.DataCell(ft.Text(action.action, size=12, color=TEXT)),
+                        ft.DataCell(ft.Text(action.language, size=12, color=TEXT_MUTED)),
+                        ft.DataCell(ft.Text(action.profile, size=12, color=TEXT)),
+                        ft.DataCell(ft.Text(action.rule_key, size=12, color=TEXT_MUTED)),
+                        ft.DataCell(ft.Text(action.message[:160], size=12, color=TEXT, max_lines=2, overflow=ft.TextOverflow.ELLIPSIS)),
+                    ]
+                )
+            )
+        return self._table_block(
+            self.t("sync_actions"),
             ft.DataTable(
                 columns=[
                     ft.DataColumn(ft.Text("status", size=12, weight=WEIGHT_SEMIBOLD)),
@@ -1150,6 +1278,13 @@ class ProfileCreatorApp:
                         [
                             self._mini_badge(language, PRIMARY, PRIMARY_SOFT),
                             dropdown,
+                            ft.OutlinedButton(
+                                self.t("export_profile_rules"),
+                                icon=ft.Icons.DOWNLOAD,
+                                disabled=not self.client or not dropdown.value,
+                                on_click=lambda _e, lang=language, control=dropdown: self._export_profile_for_language(lang, str(control.value or "")),
+                                height=44,
+                            ),
                         ],
                         spacing=10,
                         wrap=True,
@@ -1176,6 +1311,22 @@ class ProfileCreatorApp:
         if dropdown.value not in names:
             dropdown.value = self.default_profiles.get(language, "") if self.default_profiles.get(language, "") in names else (names[0] if names else "")
 
+    def _refresh_export_controls(self) -> None:
+        languages = sorted(self.available_profiles)
+        self.export_language.options = [ft.DropdownOption(key=language, text=language) for language in languages]
+        if self.export_language.value not in languages:
+            self.export_language.value = languages[0] if languages else ""
+        profiles = self.available_profiles.get(str(self.export_language.value or ""), [])
+        self.export_profile.options = [ft.DropdownOption(key=name, text=name) for name in profiles]
+        if self.export_profile.value not in profiles:
+            default_profile = self.default_profiles.get(str(self.export_language.value or ""), "")
+            self.export_profile.value = default_profile if default_profile in profiles else (profiles[0] if profiles else "")
+        self.export_language.on_change = lambda _e: self._on_export_language_change()
+
+    def _on_export_language_change(self) -> None:
+        self._refresh_export_controls()
+        self.page.update()
+
     def _input_languages(self) -> list[str]:
         if not self.spreadsheet:
             return []
@@ -1196,6 +1347,8 @@ class ProfileCreatorApp:
             self.store.save(self.config)
             self.precheck_result = None
             self.apply_result = None
+            self.sync_plan = None
+            self.sync_result = None
             self.render()
         except Exception as exc:
             self._show_message(str(exc))
@@ -1278,6 +1431,107 @@ class ProfileCreatorApp:
     def _dropdown_values(self, controls: dict[str, ft.Dropdown]) -> dict[str, str]:
         return {language: str(dropdown.value or "") for language, dropdown in controls.items()}
 
+    def _export_selected_profile(self, _event: Any) -> None:
+        language = str(self.export_language.value or "")
+        profile = str(self.export_profile.value or "")
+        self._export_profile_for_language(language, profile)
+
+    def _export_profile_for_language(self, language: str, profile: str) -> None:
+        if not self.client:
+            self._show_message(self.t("no_connection"))
+            return
+        if not language or not profile:
+            self._show_message(self.t("missing_profile"))
+            return
+        self._run_background(lambda: self._export_profile_worker(language, profile))
+
+    def _export_profile_worker(self, language: str, profile: str) -> None:
+        if not self.client:
+            return
+        self._set_busy(True)
+        try:
+            target_profile = target_profile_for_language(self._current_rows_for_helpers(), language)
+            result = ProfileExportService(self.client).export_profile(language, profile, reports_dir() / "profile_exports", target_profile=target_profile)
+            self._show_message(f"{self.t('profile_exported')}: {result.xlsx_path}")
+        except Exception as exc:
+            self._show_message(str(exc))
+        finally:
+            self._set_busy(False)
+
+    def _run_sync_precheck(self, _event: Any) -> None:
+        self._run_background(self._sync_precheck_worker)
+
+    def _sync_precheck_worker(self) -> None:
+        if not self.client:
+            self._show_message(self.t("no_connection"))
+            return
+        if not self.spreadsheet:
+            self._show_message(self.t("no_file"))
+            return
+        self._set_busy(True)
+        try:
+            rows = profile_rule_rows_from_mapping(self.spreadsheet.rows, self.mapping or self.spreadsheet.inferred_mapping)
+            mode = ProfileSyncMode(str(self.sync_mode.value or ProfileSyncMode.PATCH.value))
+            self.sync_plan = ProfileSyncService(self.client).precheck(rows, mode)
+            self.sync_result = None
+            text = self.t("sync_precheck_passed") if self.sync_plan.can_apply else self.t("sync_precheck_blocked")
+            color = SUCCESS if self.sync_plan.can_apply else DANGER
+            self._set_status(self.sync_status, text, color)
+        except Exception as exc:
+            self._set_status(self.sync_status, str(exc), DANGER)
+        finally:
+            self._set_busy(False)
+            if not self._exit_requested:
+                self.render()
+
+    def _apply_sync(self, _event: Any) -> None:
+        if self.sync_plan and self.sync_plan.mode == ProfileSyncMode.REPLACE:
+            self.page.show_dialog(
+                ft.AlertDialog(
+                    title=ft.Text(self.t("confirm_replace_sync"), weight=WEIGHT_SEMIBOLD, color=TEXT),
+                    content=ft.Text(self.t("confirm_replace_sync_body"), color=TEXT_MUTED),
+                    actions=[
+                        ft.TextButton(self.t("cancel"), on_click=lambda _e: self.page.pop_dialog()),
+                        ft.FilledButton(self.t("apply_sync"), icon=ft.Icons.SYNC, on_click=self._confirm_apply_sync),
+                    ],
+                    modal=True,
+                )
+            )
+            self.page.update()
+            return
+        self._run_background(self._apply_sync_worker)
+
+    def _confirm_apply_sync(self, _event: Any) -> None:
+        self.page.pop_dialog()
+        self._run_background(self._apply_sync_worker)
+
+    def _apply_sync_worker(self) -> None:
+        if not self.client or not self.sync_plan:
+            return
+        self._set_busy(True)
+        try:
+            result = ProfileSyncService(self.client).apply(self.sync_plan, backup_dir=reports_dir() / "profile_backups")
+            self.sync_result = export_sync_report(result)
+            self._show_message(self.t("report_created"))
+        except Exception as exc:
+            self._show_message(str(exc))
+        finally:
+            self._set_busy(False)
+            if not self._exit_requested:
+                self.render()
+
+    def _export_sync_precheck(self, _event: Any) -> None:
+        if not self.sync_plan:
+            return
+        _json_path, xlsx_path = export_sync_precheck_report(self.sync_plan)
+        self._show_message(f"{self.t('report_created')}: {xlsx_path}")
+
+    def _current_rows_for_helpers(self) -> list[RuleRow]:
+        if not self.spreadsheet:
+            return []
+        mapping = self.mapping or self.spreadsheet.inferred_mapping
+        return rows_from_mapping(self.spreadsheet.rows, mapping)
+
     def _apply_changes(self, _event: Any) -> None:
         self._run_background(self._apply_worker)
 
@@ -1305,9 +1559,14 @@ class ProfileCreatorApp:
         self._show_message(f"{self.t('report_created')}: {xlsx_path}")
 
     def _open_report_folder(self, _event: Any) -> None:
-        if not self.apply_result or not self.apply_result.report_xlsx:
+        report_xlsx = None
+        if self.apply_result and self.apply_result.report_xlsx:
+            report_xlsx = self.apply_result.report_xlsx
+        elif self.sync_result and self.sync_result.report_xlsx:
+            report_xlsx = self.sync_result.report_xlsx
+        if not report_xlsx:
             return
-        folder = str(self.apply_result.report_xlsx.parent)
+        folder = str(report_xlsx.parent)
         try:
             os.startfile(folder)
         except AttributeError:
@@ -1416,6 +1675,11 @@ def languages_from_rows(rows: Iterable[RuleRow]) -> list[str]:
 def selected_profiles_by_language(values: dict[str, str], languages: Iterable[str]) -> dict[str, str]:
     language_set = set(languages)
     return {language: profile for language, profile in values.items() if language in language_set and profile}
+
+
+def target_profile_for_language(rows: Iterable[RuleRow], language: str) -> str:
+    profiles = sorted({row.target_profile for row in rows if row.language == language and row.target_profile})
+    return profiles[0] if len(profiles) == 1 else ""
 
 
 def _request_process_exit() -> None:

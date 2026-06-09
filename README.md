@@ -15,6 +15,8 @@ Windows app for PMs and non-developers to create SonarQube Quality Profiles from
   - Create an independent profile
 - Runs dry-run precheck before writing changes.
 - Activates rules, binds projects, sets default profiles, and exports profile backups.
+- Exports existing Quality Profiles to PM-editable CSV/XLSX files.
+- Syncs edited Profile Rules files back to SonarQube in patch or replace mode.
 - Exports `report.json` and `report.xlsx`.
 
 ## Run From Source
@@ -51,11 +53,27 @@ python -m sonarqube_profile_creator.main --create-templates templates
 
 - `parent_profile`
 - `strategy`
+- `active`
+- `sync_action`
+- `source_profile`
+- `profile_key`
+- `rule_name`
+- `inheritance`
 - `severity`
 - `params`
 - `prioritizedRule`
 - `project_key`
 - `set_default`
+- `note`
+
+## Profile Export And Sync
+
+After connecting to SonarQube, use `Profile export / sync` to export an existing profile to CSV/XLSX. PMs can edit the exported `Profile Rules` table.
+
+- Patch mode processes only rows in the table.
+- Replace mode also plans deactivation for active server rules missing from the table.
+- Set `active=false` to explicitly deactivate a rule during sync.
+- Leave `sync_action` blank for automatic diff, or use `activate`, `update`, `deactivate`, `noop`, or `skip`.
 
 ## SonarQube Permissions
 
@@ -75,7 +93,7 @@ The generated single-file app is placed at `dist\SonarQubeProfileCreator.exe`.
 GitHub Actions runs tests on `main` and pull requests. Version tags build the Windows EXE and publish a GitHub Release.
 
 ```powershell
-git tag v1.0.0
+git tag v1.1.0
 git push origin main
-git push origin v1.0.0
+git push origin v1.1.0
 ```

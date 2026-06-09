@@ -13,6 +13,11 @@ class ProfileStrategy(str, Enum):
     INDEPENDENT = "independent"
 
 
+class ProfileSyncMode(str, Enum):
+    PATCH = "patch"
+    REPLACE = "replace"
+
+
 class ItemStatus(str, Enum):
     OK = "ok"
     SKIPPED = "skipped"
@@ -24,11 +29,18 @@ REQUIRED_FIELDS = ("language", "target_profile", "rule_key")
 OPTIONAL_FIELDS = (
     "parent_profile",
     "strategy",
+    "active",
+    "sync_action",
+    "source_profile",
+    "profile_key",
+    "rule_name",
+    "inheritance",
     "severity",
     "params",
     "prioritizedRule",
     "project_key",
     "set_default",
+    "note",
 )
 ALL_FIELDS = REQUIRED_FIELDS + OPTIONAL_FIELDS
 
@@ -41,11 +53,37 @@ class RuleRow:
     rule_key: str
     parent_profile: str = ""
     strategy: str = ""
+    active: str = ""
+    sync_action: str = ""
+    source_profile: str = ""
+    profile_key: str = ""
+    rule_name: str = ""
+    inheritance: str = ""
     severity: str = ""
     params: str = ""
     prioritizedRule: str = ""
     project_key: str = ""
     set_default: str = ""
+    note: str = ""
+    raw: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ProfileRuleRow:
+    source_row: int
+    language: str
+    target_profile: str
+    profile_key: str
+    source_profile: str
+    rule_key: str
+    rule_name: str = ""
+    active: str = "true"
+    severity: str = ""
+    params: str = ""
+    prioritizedRule: str = ""
+    inheritance: str = ""
+    sync_action: str = ""
+    note: str = ""
     raw: dict[str, Any] = field(default_factory=dict)
 
 
@@ -132,3 +170,34 @@ class ApplyResult:
     def has_errors(self) -> bool:
         return any(action.status == ItemStatus.ERROR for action in self.actions)
 
+
+@dataclass
+class ProfileExportResult:
+    rows: list[ProfileRuleRow]
+    csv_path: Path | None = None
+    xlsx_path: Path | None = None
+
+
+@dataclass
+class ProfileSyncPlan:
+    mode: ProfileSyncMode
+    rows: list[ProfileRuleRow]
+    actions: list[ActionResult] = field(default_factory=list)
+    issues: list[ValidationIssue] = field(default_factory=list)
+    profile_keys: dict[tuple[str, str], str] = field(default_factory=dict)
+
+    @property
+    def can_apply(self) -> bool:
+        return all(issue.status != ItemStatus.ERROR for issue in self.issues)
+
+
+@dataclass
+class ProfileSyncResult:
+    plan: ProfileSyncPlan
+    actions: list[ActionResult] = field(default_factory=list)
+    report_json: Path | None = None
+    report_xlsx: Path | None = None
+
+    @property
+    def has_errors(self) -> bool:
+        return any(action.status == ItemStatus.ERROR for action in self.actions)

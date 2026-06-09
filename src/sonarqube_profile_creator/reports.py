@@ -12,7 +12,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 
 from .config import reports_dir
-from .models import ActionResult, ApplyResult, ItemStatus, PrecheckResult, ValidationIssue
+from .models import ActionResult, ApplyResult, ItemStatus, PrecheckResult, ProfileSyncPlan, ProfileSyncResult, ValidationIssue
 
 
 def export_precheck_report(precheck: PrecheckResult, output_dir: Path | None = None) -> tuple[Path, Path]:
@@ -37,6 +37,28 @@ def export_apply_report(apply_result: ApplyResult, output_dir: Path | None = Non
     return apply_result
 
 
+def export_sync_precheck_report(plan: ProfileSyncPlan, output_dir: Path | None = None) -> tuple[Path, Path]:
+    output_dir = output_dir or _timestamped_report_dir()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / "sync_precheck_report.json"
+    xlsx_path = output_dir / "sync_precheck_report.xlsx"
+    json_path.write_text(json.dumps(_serialize_sync_plan(plan), indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_sync_workbook(plan, [], xlsx_path)
+    return json_path, xlsx_path
+
+
+def export_sync_report(result: ProfileSyncResult, output_dir: Path | None = None) -> ProfileSyncResult:
+    output_dir = output_dir or _timestamped_report_dir()
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / "sync_report.json"
+    xlsx_path = output_dir / "sync_report.xlsx"
+    json_path.write_text(json.dumps(_serialize_sync_result(result), indent=2, ensure_ascii=False), encoding="utf-8")
+    _write_sync_workbook(result.plan, result.actions, xlsx_path)
+    result.report_json = json_path
+    result.report_xlsx = xlsx_path
+    return result
+
+
 def _timestamped_report_dir() -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return reports_dir() / stamp
@@ -58,6 +80,25 @@ def _serialize_apply(apply_result: ApplyResult) -> dict[str, Any]:
         "actions": [_dataclass_dict(action) for action in apply_result.actions],
         "report_json": str(apply_result.report_json or ""),
         "report_xlsx": str(apply_result.report_xlsx or ""),
+    }
+
+
+def _serialize_sync_plan(plan: ProfileSyncPlan) -> dict[str, Any]:
+    return {
+        "mode": plan.mode.value,
+        "rows": [_dataclass_dict(row) for row in plan.rows],
+        "actions": [_dataclass_dict(action) for action in plan.actions],
+        "issues": [_dataclass_dict(issue) for issue in plan.issues],
+        "profile_keys": {f"{language}:{profile}": key for (language, profile), key in plan.profile_keys.items()},
+    }
+
+
+def _serialize_sync_result(result: ProfileSyncResult) -> dict[str, Any]:
+    return {
+        "plan": _serialize_sync_plan(result.plan),
+        "actions": [_dataclass_dict(action) for action in result.actions],
+        "report_json": str(result.report_json or ""),
+        "report_xlsx": str(result.report_xlsx or ""),
     }
 
 
@@ -126,11 +167,18 @@ def _write_rows(sheet, precheck: PrecheckResult) -> None:
             "rule_key",
             "parent_profile",
             "strategy",
+            "active",
+            "sync_action",
+            "source_profile",
+            "profile_key",
+            "rule_name",
+            "inheritance",
             "severity",
             "params",
             "prioritizedRule",
             "project_key",
             "set_default",
+            "note",
         )
     )
     for row in precheck.rows:
@@ -142,11 +190,18 @@ def _write_rows(sheet, precheck: PrecheckResult) -> None:
                 row.rule_key,
                 row.parent_profile,
                 row.strategy,
+                row.active,
+                row.sync_action,
+                row.source_profile,
+                row.profile_key,
+                row.rule_name,
+                row.inheritance,
                 row.severity,
                 row.params,
                 row.prioritizedRule,
                 row.project_key,
                 row.set_default,
+                row.note,
             )
         )
 
@@ -191,6 +246,83 @@ def _write_actions(sheet, actions: list[ActionResult]) -> None:
         )
 
 
+def _write_sync_workbook(plan: ProfileSyncPlan, actions: list[ActionResult], path: Path) -> None:
+    workbook = Workbook()
+    summary = workbook.active
+    summary.title = "Summary"
+    _write_sync_summary(summary, plan, actions)
+    _write_profile_rule_rows(workbook.create_sheet("Profile Rules"), plan)
+    _write_issues(workbook.create_sheet("Precheck Issues"), plan.issues)
+    _write_actions(workbook.create_sheet("Planned Actions"), plan.actions)
+    _write_actions(workbook.create_sheet("Actions"), actions)
+    for sheet in workbook.worksheets:
+        _style_sheet(sheet)
+    workbook.save(path)
+
+
+def _write_sync_summary(sheet, plan: ProfileSyncPlan, actions: list[ActionResult]) -> None:
+    action_counts = Counter(action.status.value for action in actions)
+    issue_counts = Counter(issue.status.value for issue in plan.issues)
+    planned_counts = Counter(action.action for action in plan.actions)
+    rows = [
+        ("Generated At", datetime.now().isoformat(timespec="seconds")),
+        ("Mode", plan.mode.value),
+        ("Can Apply", "Yes" if plan.can_apply else "No"),
+        ("Input Rows", len(plan.rows)),
+        ("Planned Actions", len(plan.actions)),
+        ("Plan Activate", planned_counts.get("activate", 0)),
+        ("Plan Update", planned_counts.get("update", 0)),
+        ("Plan Deactivate", planned_counts.get("deactivate", 0)),
+        ("Precheck Errors", issue_counts.get(ItemStatus.ERROR.value, 0)),
+        ("Precheck Warnings", issue_counts.get(ItemStatus.WARNING.value, 0)),
+        ("Action Success", action_counts.get(ItemStatus.OK.value, 0)),
+        ("Action Skipped", action_counts.get(ItemStatus.SKIPPED.value, 0)),
+        ("Action Errors", action_counts.get(ItemStatus.ERROR.value, 0)),
+    ]
+    sheet.append(("Metric", "Value"))
+    for row in rows:
+        sheet.append(row)
+
+
+def _write_profile_rule_rows(sheet, plan: ProfileSyncPlan) -> None:
+    headers = (
+        "source_row",
+        "language",
+        "target_profile",
+        "profile_key",
+        "source_profile",
+        "rule_key",
+        "rule_name",
+        "active",
+        "severity",
+        "params",
+        "prioritizedRule",
+        "inheritance",
+        "sync_action",
+        "note",
+    )
+    sheet.append(headers)
+    for row in plan.rows:
+        sheet.append(
+            (
+                row.source_row,
+                row.language,
+                row.target_profile,
+                row.profile_key,
+                row.source_profile,
+                row.rule_key,
+                row.rule_name,
+                row.active,
+                row.severity,
+                row.params,
+                row.prioritizedRule,
+                row.inheritance,
+                row.sync_action,
+                row.note,
+            )
+        )
+
+
 def _style_sheet(sheet) -> None:
     header_fill = PatternFill("solid", fgColor="1F4E79")
     header_font = Font(bold=True, color="FFFFFF")
@@ -207,4 +339,3 @@ def _style_sheet(sheet) -> None:
             max_length = max(max_length, len(value))
             cell.alignment = Alignment(vertical="top", wrap_text=True)
         sheet.column_dimensions[letter].width = min(max(max_length + 2, 12), 52)
-

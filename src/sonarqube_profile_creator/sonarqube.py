@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import base64
+import copy
+import threading
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urljoin
 
 import requests
+
+from .concurrency import bounded_parallel_map, client_read_workers
 
 
 class SonarQubeError(RuntimeError):
@@ -25,29 +29,59 @@ class ConnectionInfo:
 
 
 class SonarQubeClient:
-    def __init__(self, server_url: str, token: str, timeout: int = 20) -> None:
+    def __init__(self, server_url: str, token: str, timeout: int = 20, max_read_workers: int = 8, max_write_workers: int = 4) -> None:
         self.server_url = server_url.rstrip("/") + "/"
         self.token = token.strip()
         self.timeout = timeout
-        self.session = requests.Session()
-        self.session.headers.update({"User-Agent": "SonarQubeProfileCreator/0.1"})
+        self.max_read_workers = max_read_workers
+        self.max_write_workers = max_write_workers
+        self._headers = {"User-Agent": "SonarQubeProfileCreator/0.1"}
         if self.token:
-            self.session.headers.update({"Authorization": f"Bearer {self.token}"})
+            self._headers["Authorization"] = f"Bearer {self.token}"
+        self._local = threading.local()
+        self._cache_lock = threading.Lock()
+        self._profiles_cache: dict[tuple[str, str, bool], list[dict[str, Any]]] = {}
+        self._profile_by_name_cache: dict[tuple[str, str], dict[str, Any] | None] = {}
+        self._rule_cache: dict[str, dict[str, Any] | None] = {}
+        self._active_rules_cache: dict[str, list[dict[str, Any]]] = {}
+        self._rule_activation_cache: dict[tuple[str, str], dict[str, Any]] = {}
+
+    @property
+    def session(self) -> requests.Session:
+        session = getattr(self._local, "session", None)
+        if session is None:
+            session = requests.Session()
+            session.headers.update(self._headers)
+            self._local.session = session
+        return session
 
     def test_connection(self) -> ConnectionInfo:
-        status_payload = self.get("api/system/status")
-        version = self.get_text("api/server/version")
-        webservices = self.get("api/webservices/list", params={"include_internals": "false"})
-        capabilities = self._extract_capabilities(webservices)
+        def load(name: str) -> tuple[str, Any]:
+            if name == "status":
+                return (name, self.get("api/system/status"))
+            return (name, self.get_text("api/server/version"))
+
+        loaded = dict(bounded_parallel_map(["status", "version"], load, client_read_workers(self, 2)))
+        status_payload = loaded["status"]
+        version = loaded["version"]
         return ConnectionInfo(
             server_url=self.server_url.rstrip("/"),
             version=version.strip(),
             status=str(status_payload.get("status", "")),
             auth_mode="Bearer token",
-            capabilities=capabilities,
+            capabilities={},
         )
 
+    def load_capabilities(self) -> dict[str, bool]:
+        webservices = self.get("api/webservices/list", params={"include_internals": "false"})
+        return self._extract_capabilities(webservices)
+
     def search_quality_profiles(self, language: str = "", quality_profile: str = "", defaults: bool = False) -> list[dict[str, Any]]:
+        cache_key = (language, quality_profile, defaults)
+        with self._cache_lock:
+            cached = self._profiles_cache.get(cache_key)
+        if cached is not None:
+            return copy.deepcopy(cached)
         params: dict[str, Any] = {}
         if language:
             params["language"] = language
@@ -56,9 +90,15 @@ class SonarQubeClient:
         if defaults:
             params["defaults"] = "true"
         payload = self.get("api/qualityprofiles/search", params=params)
-        return list(payload.get("profiles", []))
+        profiles = list(payload.get("profiles", []))
+        with self._cache_lock:
+            self._profiles_cache[cache_key] = copy.deepcopy(profiles)
+        return profiles
 
     def get_default_profiles(self) -> dict[str, str]:
+        cached_defaults = self._default_profiles_from_cached_all_profiles()
+        if cached_defaults:
+            return cached_defaults
         profiles = self.search_quality_profiles(defaults=True)
         result: dict[str, str] = {}
         for profile in profiles:
@@ -68,23 +108,51 @@ class SonarQubeClient:
                 result[language] = name
         return result
 
+    def _default_profiles_from_cached_all_profiles(self) -> dict[str, str]:
+        with self._cache_lock:
+            profiles = copy.deepcopy(self._profiles_cache.get(("", "", False), []))
+        result: dict[str, str] = {}
+        for profile in profiles:
+            if not _profile_is_default(profile):
+                continue
+            language = str(profile.get("language", ""))
+            name = str(profile.get("name", ""))
+            if language and name:
+                result[language] = name
+        return result
+
     def get_profile_by_name(self, language: str, quality_profile: str) -> dict[str, Any] | None:
+        cache_key = (language, quality_profile.casefold())
+        with self._cache_lock:
+            if cache_key in self._profile_by_name_cache:
+                cached = self._profile_by_name_cache[cache_key]
+                return copy.deepcopy(cached) if cached is not None else None
         for profile in self.search_quality_profiles(language=language, quality_profile=quality_profile):
             if str(profile.get("name", "")).casefold() == quality_profile.casefold():
+                with self._cache_lock:
+                    self._profile_by_name_cache[cache_key] = copy.deepcopy(profile)
                 return profile
+        with self._cache_lock:
+            self._profile_by_name_cache[cache_key] = None
         return None
 
     def create_profile(self, language: str, name: str) -> dict[str, Any]:
-        return self.post("api/qualityprofiles/create", data={"language": language, "name": name})
+        result = self.post("api/qualityprofiles/create", data={"language": language, "name": name})
+        self.clear_cache()
+        return result
 
     def copy_profile(self, from_key: str, to_name: str) -> dict[str, Any]:
-        return self.post("api/qualityprofiles/copy", data={"fromKey": from_key, "toName": to_name})
+        result = self.post("api/qualityprofiles/copy", data={"fromKey": from_key, "toName": to_name})
+        self.clear_cache()
+        return result
 
     def change_parent(self, language: str, quality_profile: str, parent_quality_profile: str = "") -> dict[str, Any]:
         data = {"language": language, "qualityProfile": quality_profile}
         if parent_quality_profile:
             data["parentQualityProfile"] = parent_quality_profile
-        return self.post("api/qualityprofiles/change_parent", data=data)
+        result = self.post("api/qualityprofiles/change_parent", data=data)
+        self.clear_profile_cache(language, quality_profile)
+        return result
 
     def show_rule(self, rule_key: str, actives: bool = False) -> dict[str, Any] | None:
         try:
@@ -95,41 +163,81 @@ class SonarQubeClient:
             raise
 
     def search_rule(self, rule_key: str) -> dict[str, Any] | None:
+        with self._cache_lock:
+            if rule_key in self._rule_cache:
+                cached = self._rule_cache[rule_key]
+                return copy.deepcopy(cached) if cached is not None else None
         payload = self.get("api/rules/search", params={"rule_key": rule_key, "ps": 1})
         rules = payload.get("rules", [])
         if rules:
-            return rules[0]
+            rule = rules[0]
+            with self._cache_lock:
+                self._rule_cache[rule_key] = copy.deepcopy(rule)
+            return rule
+        with self._cache_lock:
+            self._rule_cache[rule_key] = None
         return None
 
     def search_active_rules(self, profile_key: str) -> list[dict[str, Any]]:
-        rules: list[dict[str, Any]] = []
-        page = 1
+        with self._cache_lock:
+            cached = self._active_rules_cache.get(profile_key)
+        if cached is not None:
+            return copy.deepcopy(cached)
         page_size = 500
-        while True:
-            payload = self.get(
-                "api/rules/search",
-                params={
-                    "qprofile": profile_key,
-                    "activation": "true",
-                    "p": page,
-                    "ps": page_size,
-                },
-            )
-            batch = list(payload.get("rules", []))
+        first_payload = self._search_active_rules_page(profile_key, 1, page_size)
+        first_batch = list(first_payload.get("rules", []))
+        paging = first_payload.get("paging", {})
+        total = int(paging.get("total", len(first_batch)) or 0)
+        if total <= len(first_batch):
+            with self._cache_lock:
+                self._active_rules_cache[profile_key] = copy.deepcopy(first_batch)
+            return first_batch
+        effective_page_size = int(paging.get("pageSize", page_size) or page_size)
+        if first_batch and total > len(first_batch) and len(first_batch) < effective_page_size:
+            effective_page_size = len(first_batch)
+        page_count = (total + effective_page_size - 1) // effective_page_size
+        pages = list(range(2, page_count + 1))
+
+        def load_page(page: int) -> list[dict[str, Any]]:
+            payload = self._search_active_rules_page(profile_key, page, page_size)
+            return list(payload.get("rules", []))
+
+        rules = first_batch
+        for batch in bounded_parallel_map(pages, load_page, client_read_workers(self, len(pages))):
             rules.extend(batch)
-            paging = payload.get("paging", {})
-            total = int(paging.get("total", len(rules)) or 0)
-            if len(rules) >= total or not batch:
-                return rules
-            page += 1
+        with self._cache_lock:
+            self._active_rules_cache[profile_key] = copy.deepcopy(rules)
+        return rules
+
+    def _search_active_rules_page(self, profile_key: str, page: int, page_size: int) -> dict[str, Any]:
+        return self.get(
+            "api/rules/search",
+            params={
+                "qprofile": profile_key,
+                "activation": "true",
+                "f": "actives,name,severity,params",
+                "p": page,
+                "ps": page_size,
+            },
+        )
 
     def show_rule_activation(self, rule_key: str, profile_key: str) -> dict[str, Any]:
+        cache_key = (rule_key, profile_key)
+        with self._cache_lock:
+            cached = self._rule_activation_cache.get(cache_key)
+        if cached is not None:
+            return copy.deepcopy(cached)
         payload = self.show_rule(rule_key, actives=True) or {}
         actives = payload.get("actives", [])
         for active in actives:
             active_profile_key = str(active.get("qProfile") or active.get("qProfileKey") or active.get("profileKey") or "")
             if active_profile_key == profile_key:
-                return dict(active)
+                result = dict(active)
+                with self._cache_lock:
+                    self._rule_activation_cache[cache_key] = copy.deepcopy(result)
+                return result
+        with self._cache_lock:
+            self._rule_activation_cache[cache_key] = {}
         return {}
 
     def activate_rule(
@@ -147,10 +255,14 @@ class SonarQubeClient:
             data["params"] = params
         if prioritized_rule:
             data["prioritizedRule"] = prioritized_rule
-        return self.post("api/qualityprofiles/activate_rule", data=data)
+        result = self.post("api/qualityprofiles/activate_rule", data=data)
+        self.clear_profile_cache(profile_key=profile_key)
+        return result
 
     def deactivate_rule(self, profile_key: str, rule_key: str) -> dict[str, Any]:
-        return self.post("api/qualityprofiles/deactivate_rule", data={"key": profile_key, "rule": rule_key})
+        result = self.post("api/qualityprofiles/deactivate_rule", data={"key": profile_key, "rule": rule_key})
+        self.clear_profile_cache(profile_key=profile_key)
+        return result
 
     def add_project(self, language: str, project_key: str, quality_profile: str) -> dict[str, Any]:
         return self.post(
@@ -159,10 +271,12 @@ class SonarQubeClient:
         )
 
     def set_default(self, language: str, quality_profile: str) -> dict[str, Any]:
-        return self.post(
+        result = self.post(
             "api/qualityprofiles/set_default",
             data={"language": language, "qualityProfile": quality_profile},
         )
+        self.clear_cache()
+        return result
 
     def backup_profile(self, language: str, quality_profile: str) -> bytes:
         return self.request(
@@ -256,7 +370,37 @@ class SonarQubeClient:
                 indexed.add((path, str(action.get("key", ""))))
         return {name: target in indexed for name, target in wanted.items()}
 
+    def clear_cache(self) -> None:
+        with self._cache_lock:
+            self._profiles_cache.clear()
+            self._profile_by_name_cache.clear()
+            self._rule_cache.clear()
+            self._active_rules_cache.clear()
+            self._rule_activation_cache.clear()
+
+    def clear_profile_cache(self, language: str = "", quality_profile: str = "", profile_key: str = "") -> None:
+        with self._cache_lock:
+            self._profiles_cache.clear()
+            self._profile_by_name_cache.clear()
+            if profile_key:
+                self._active_rules_cache.pop(profile_key, None)
+                for key in [key for key in self._rule_activation_cache if key[1] == profile_key]:
+                    self._rule_activation_cache.pop(key, None)
+            if language or quality_profile:
+                self._active_rules_cache.clear()
+                self._rule_activation_cache.clear()
+
 
 def basic_auth_header(token: str) -> str:
     encoded = base64.b64encode(f"{token}:".encode("utf-8")).decode("ascii")
     return f"Basic {encoded}"
+
+
+def _profile_is_default(profile: dict[str, Any]) -> bool:
+    for key in ("isDefault", "default", "is_default"):
+        value = profile.get(key)
+        if value is True:
+            return True
+        if isinstance(value, str) and value.strip().casefold() == "true":
+            return True
+    return False

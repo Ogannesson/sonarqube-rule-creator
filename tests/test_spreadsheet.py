@@ -7,6 +7,7 @@ from sonarqube_profile_creator.spreadsheet import (
     read_spreadsheet,
     rows_from_mapping,
     validate_required_mapping,
+    write_example_templates,
     write_profile_rules,
 )
 
@@ -46,6 +47,41 @@ def test_read_csv_and_map_rows(tmp_path: Path):
     assert set(REQUIRED_FIELDS).issubset(data.inferred_mapping.columns)
 
 
+def test_read_csv_accepts_gb18030_chinese_files(tmp_path: Path):
+    csv_path = tmp_path / "rules_gbk.csv"
+    csv_path.write_bytes("规则Key;严重级别\njava:S1144;MAJOR\n".encode("gb18030"))
+
+    data = read_spreadsheet(csv_path)
+    rows = rows_from_mapping(data.rows, data.inferred_mapping)
+
+    assert data.headers == ["规则Key", "严重级别"]
+    assert rows[0].rule_key == "java:S1144"
+    assert rows[0].severity == "MAJOR"
+
+
+def test_read_csv_preserves_duplicate_headers(tmp_path: Path):
+    csv_path = tmp_path / "duplicate_headers.csv"
+    csv_path.write_text("rule_key,rule_key\njava:S1144,java:S112\n", encoding="utf-8-sig")
+
+    data = read_spreadsheet(csv_path)
+
+    assert data.headers == ["rule_key", "rule_key_2"]
+    assert data.rows[0]["rule_key"] == "java:S1144"
+    assert data.rows[0]["rule_key_2"] == "java:S112"
+
+
+def test_example_template_keeps_profile_settings_out_of_table(tmp_path: Path):
+    csv_path, xlsx_path = write_example_templates(tmp_path)
+
+    data = read_spreadsheet(csv_path)
+    xlsx_data = read_spreadsheet(xlsx_path)
+
+    assert data.headers == ["rule_key", "active", "severity", "params", "prioritizedRule", "note"]
+    assert "target_profile" not in data.headers
+    assert "language" not in data.headers
+    assert xlsx_data.headers == data.headers
+
+
 def test_profile_rule_rows_roundtrip_csv_xlsx(tmp_path: Path):
     rows = [
         ProfileRuleRow(
@@ -76,3 +112,16 @@ def test_profile_rule_rows_roundtrip_csv_xlsx(tmp_path: Path):
     assert csv_rows[0].active == "false"
     assert csv_rows[0].sync_action == "deactivate"
     assert xlsx_rows[0].rule_name == "Unused private methods"
+
+
+def test_profile_rule_source_row_falls_back_when_pm_edits_row_number(tmp_path: Path):
+    csv_path = tmp_path / "profile_rules.csv"
+    csv_path.write_text(
+        "source_row,language,target_profile,profile_key,source_profile,rule_key\nrow two,java,Demo,java-demo,Base,java:S1144\n",
+        encoding="utf-8-sig",
+    )
+
+    data = read_spreadsheet(csv_path)
+    rows = profile_rule_rows_from_mapping(data.rows, data.inferred_mapping)
+
+    assert rows[0].source_row == 2

@@ -112,14 +112,27 @@ def read_spreadsheet(path: str | Path, preview_limit: int = 20) -> SpreadsheetDa
 
 
 def _read_csv(path: Path) -> tuple[list[str], list[dict[str, Any]]]:
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        headers = [str(header or "").strip() for header in (reader.fieldnames or [])]
-        rows = [
-            {str(key or "").strip(): _clean_value(value) for key, value in row.items()}
-            for row in reader
-            if any(_clean_value(value) for value in row.values())
-        ]
+    for encoding in ("utf-8-sig", "gb18030"):
+        try:
+            return _read_csv_with_encoding(path, encoding)
+        except UnicodeDecodeError:
+            continue
+    return _read_csv_with_encoding(path, "utf-8-sig")
+
+
+def _read_csv_with_encoding(path: Path, encoding: str) -> tuple[list[str], list[dict[str, Any]]]:
+    with path.open("r", encoding=encoding, newline="") as handle:
+        sample = handle.read(4096)
+        handle.seek(0)
+        dialect = _csv_dialect(sample)
+        reader = csv.reader(handle, dialect=dialect)
+        raw_headers = next(reader, [])
+        headers = _dedupe_headers([str(header or "").strip() for header in raw_headers])
+        rows = []
+        for raw in reader:
+            normalized = _normalize_csv_row(raw, headers)
+            if any(normalized.values()):
+                rows.append(normalized)
     return headers, rows
 
 
@@ -129,7 +142,7 @@ def _read_xlsx(path: Path) -> tuple[list[str], list[dict[str, Any]]]:
     raw_rows = list(sheet.iter_rows(values_only=True))
     if not raw_rows:
         return [], []
-    headers = [str(value or "").strip() for value in raw_rows[0]]
+    headers = _dedupe_headers([str(value or "").strip() for value in raw_rows[0]])
     rows: list[dict[str, Any]] = []
     for raw in raw_rows[1:]:
         values = [_clean_value(value) for value in raw]
@@ -190,7 +203,7 @@ def profile_rule_rows_from_mapping(rows: list[dict[str, Any]], mapping: FieldMap
             payload[field] = _clean_value(raw.get(source, "")) if source else ""
         mapped.append(
             ProfileRuleRow(
-                source_row=int(payload["source_row"] or index),
+                source_row=_parse_source_row(payload["source_row"], index),
                 language=payload["language"],
                 target_profile=payload["target_profile"],
                 profile_key=payload["profile_key"],
@@ -208,6 +221,42 @@ def profile_rule_rows_from_mapping(rows: list[dict[str, Any]], mapping: FieldMap
             )
         )
     return mapped
+
+
+def _csv_dialect(sample: str) -> csv.Dialect:
+    try:
+        return csv.Sniffer().sniff(sample, delimiters=",;\t")
+    except csv.Error:
+        return csv.excel
+
+
+def _dedupe_headers(headers: list[str]) -> list[str]:
+    seen: dict[str, int] = {}
+    result: list[str] = []
+    for index, header in enumerate(headers, start=1):
+        base = header or f"column_{index}"
+        count = seen.get(base, 0) + 1
+        seen[base] = count
+        result.append(base if count == 1 else f"{base}_{count}")
+    return result
+
+
+def _normalize_csv_row(row: list[Any], headers: list[str]) -> dict[str, str]:
+    return {header: _clean_value(row[index]) if index < len(row) else "" for index, header in enumerate(headers)}
+
+
+def _parse_source_row(value: object, fallback: int) -> int:
+    text = _clean_value(value)
+    if not text:
+        return fallback
+    try:
+        return int(text)
+    except ValueError:
+        try:
+            number = float(text)
+        except ValueError:
+            return fallback
+        return int(number) if number.is_integer() else fallback
 
 
 def write_profile_rules(output_dir: str | Path, rows: list[ProfileRuleRow], name: str = "profile_rules") -> tuple[Path, Path]:
@@ -232,8 +281,8 @@ def write_profile_rules(output_dir: str | Path, rows: list[ProfileRuleRow], name
     return csv_path, xlsx_path
 
 
-def validate_required_mapping(mapping: FieldMapping) -> list[str]:
-    return [field for field in REQUIRED_FIELDS if not mapping.source_for(field)]
+def validate_required_mapping(mapping: FieldMapping, required_fields: tuple[str, ...] = REQUIRED_FIELDS) -> list[str]:
+    return [field for field in required_fields if not mapping.source_for(field)]
 
 
 def write_example_templates(output_dir: str | Path) -> tuple[Path, Path]:
@@ -241,28 +290,20 @@ def write_example_templates(output_dir: str | Path) -> tuple[Path, Path]:
     path.mkdir(parents=True, exist_ok=True)
     rows = [
         {
-            "language": "java",
-            "target_profile": "PM Demo Java Profile",
             "rule_key": "java:S1144",
-            "parent_profile": "",
-            "strategy": "extend_default",
+            "active": "true",
             "severity": "MAJOR",
             "params": "",
             "prioritizedRule": "false",
-            "project_key": "",
-            "set_default": "false",
+            "note": "",
         },
         {
-            "language": "js",
-            "target_profile": "PM Demo JS Profile",
             "rule_key": "javascript:S1128",
-            "parent_profile": "",
-            "strategy": "extend_default",
+            "active": "true",
             "severity": "",
             "params": "",
             "prioritizedRule": "false",
-            "project_key": "",
-            "set_default": "false",
+            "note": "",
         },
     ]
     csv_path = path / "sonarqube_rules_template.csv"

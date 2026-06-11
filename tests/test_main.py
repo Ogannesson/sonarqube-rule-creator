@@ -7,6 +7,7 @@ from sonarqube_profile_creator.config import APP_DISPLAY_NAME
 from sonarqube_profile_creator.main import (
     _assets_dir,
     _file_fingerprint,
+    _flet_app_name,
     _prepare_flet_desktop_runtime,
     _register_instance_later,
     _run_flet_app,
@@ -20,6 +21,11 @@ def test_default_view_is_flet_desktop():
 
 def test_web_flag_selects_browser_view():
     assert _select_app_view(web=True) == ft.AppView.WEB_BROWSER
+
+
+def test_web_view_uses_root_mount_name():
+    assert _flet_app_name(ft.AppView.WEB_BROWSER) == ""
+    assert _flet_app_name(ft.AppView.FLET_APP) == APP_DISPLAY_NAME
 
 
 def test_desktop_view_does_not_register_browser_instance():
@@ -40,6 +46,20 @@ def test_desktop_window_uses_display_name(monkeypatch):
     assert calls[0]["name"] == APP_DISPLAY_NAME
     assert calls[0]["view"] == ft.AppView.FLET_APP
     assert calls[0]["assets_dir"].endswith("assets")
+
+
+def test_web_window_uses_root_mount_name(monkeypatch):
+    calls = []
+
+    def fake_run(**kwargs):
+        calls.append(kwargs)
+
+    monkeypatch.setattr("sonarqube_profile_creator.main.ft.run", fake_run)
+
+    _run_flet_app(ft.AppView.WEB_BROWSER)
+
+    assert calls[0]["name"] == ""
+    assert calls[0]["view"] == ft.AppView.WEB_BROWSER
 
 
 def test_assets_dir_points_to_project_assets():

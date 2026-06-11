@@ -93,7 +93,7 @@ The generated single-file app is placed at `dist\SonarQubeProfileCreator.exe`.
 GitHub Actions runs tests on `main` and pull requests. Version tags build the Windows EXE and publish a GitHub Release.
 
 ```powershell
-git tag v1.1.0
+git tag v1.2.0
 git push origin main
-git push origin v1.1.0
+git push origin v1.2.0
 ```

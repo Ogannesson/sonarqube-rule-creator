@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
+from .concurrency import bounded_parallel_map, client_read_workers, client_write_workers
 from .models import (
     ActionResult,
     ItemStatus,
@@ -18,6 +20,7 @@ from .workflow import parse_bool
 
 
 SYNC_ACTIONS = {"", "noop", "activate", "update", "deactivate", "skip", "skipped"}
+ProgressCallback = Callable[[str, float | None], None]
 
 
 class ProfileExportService:
@@ -30,7 +33,10 @@ class ProfileExportService:
         quality_profile: str,
         output_dir: Path,
         target_profile: str = "",
+        progress: ProgressCallback | None = None,
+        include_activation_details: bool = False,
     ) -> ProfileExportResult:
+        _notify(progress, "resolve", 0.05)
         profile = self.client.get_profile_by_name(language, quality_profile)
         if not profile:
             raise SonarQubeError(f"Profile '{quality_profile}' was not found for {language}.")
@@ -38,15 +44,38 @@ class ProfileExportService:
         if not profile_key:
             raise SonarQubeError(f"Profile '{quality_profile}' has no API key.")
         source_name = str(profile.get("name", quality_profile))
-        rows = self._profile_rows(language, profile_key, source_name, target_profile or source_name)
+        _notify(progress, "read", 0.15)
+        rows = self._profile_rows(
+            language,
+            profile_key,
+            source_name,
+            target_profile or source_name,
+            progress=progress,
+            include_activation_details=include_activation_details,
+        )
+        _notify(progress, "write", 0.90)
         csv_path, xlsx_path = write_profile_rules(output_dir, rows, _export_name(language, source_name))
+        _notify(progress, "done", 1.0)
         return ProfileExportResult(rows=rows, csv_path=csv_path, xlsx_path=xlsx_path)
 
-    def _profile_rows(self, language: str, profile_key: str, source_profile: str, target_profile: str) -> list[ProfileRuleRow]:
+    def _profile_rows(
+        self,
+        language: str,
+        profile_key: str,
+        source_profile: str,
+        target_profile: str,
+        progress: ProgressCallback | None = None,
+        include_activation_details: bool = False,
+    ) -> list[ProfileRuleRow]:
         rows: list[ProfileRuleRow] = []
-        for index, rule in enumerate(self.client.search_active_rules(profile_key), start=2):
+        active_rules = self.client.search_active_rules(profile_key)
+        total = len(active_rules)
+        step = max(total // 20, 1)
+        for index, rule in enumerate(active_rules, start=2):
             rule_key = str(rule.get("key", ""))
-            activation = self.client.show_rule_activation(rule_key, profile_key) if rule_key else {}
+            activation = _activation_from_rule(rule, profile_key)
+            if include_activation_details and rule_key and not activation:
+                activation = self.client.show_rule_activation(rule_key, profile_key)
             rows.append(
                 ProfileRuleRow(
                     source_row=index,
@@ -66,6 +95,9 @@ class ProfileExportService:
                     raw=rule,
                 )
             )
+            done = index - 1
+            if progress and (done == total or done % step == 0):
+                _notify(progress, "prepare", 0.20 + (0.65 * done / max(total, 1)))
         return rows
 
 
@@ -83,8 +115,26 @@ class ProfileSyncService:
             issues.extend(_validate_sync_row(row))
         valid_rows = [row for row in rows if not any(issue.source_row == row.source_row and issue.status == ItemStatus.ERROR for issue in issues)]
 
-        for language, target_profile in sorted({(row.language, row.target_profile) for row in valid_rows}):
-            profile = self.client.get_profile_by_name(language, target_profile)
+        profile_targets = sorted({(row.language, row.target_profile) for row in valid_rows})
+
+        def load_profile(target: tuple[str, str]) -> tuple[str, str, dict | None, SonarQubeError | None]:
+            language, target_profile = target
+            try:
+                return (language, target_profile, self.client.get_profile_by_name(language, target_profile), None)
+            except SonarQubeError as exc:
+                return (language, target_profile, None, exc)
+
+        for language, target_profile, profile, exc in bounded_parallel_map(profile_targets, load_profile, client_read_workers(self.client, len(profile_targets))):
+            if exc:
+                issues.append(
+                    ValidationIssue(
+                        status=ItemStatus.ERROR,
+                        category="api_error",
+                        message=f"Profile lookup failed for {target_profile}: {exc}",
+                        suggestion="Check SonarQube permissions and API availability.",
+                    )
+                )
+                continue
             if not profile:
                 issues.append(
                     ValidationIssue(
@@ -98,7 +148,7 @@ class ProfileSyncService:
             profile_keys[(language, target_profile)] = str(profile.get("key", ""))
 
         server_rules = self._server_rules(profile_keys, issues)
-        rule_exists = self._rule_existence(valid_rows, issues)
+        rule_exists = self._rule_existence(valid_rows, issues, server_rules)
         for row in valid_rows:
             profile_key = profile_keys.get((row.language, row.target_profile), row.profile_key)
             marker = (row.language, row.target_profile, row.rule_key)
@@ -143,6 +193,7 @@ class ProfileSyncService:
             return ProfileSyncResult(plan=plan, actions=actions)
 
         backed_up: set[tuple[str, str]] = set()
+        write_jobs: list[ActionResult] = []
         for planned in plan.actions:
             if planned.action in {"noop", "skipped"}:
                 actions.append(planned)
@@ -167,6 +218,11 @@ class ProfileSyncService:
             if not row and planned.action != "deactivate":
                 actions.append(planned)
                 continue
+            write_jobs.append(planned)
+
+        def apply_one(planned: ActionResult) -> ActionResult:
+            profile_key = plan.profile_keys.get((planned.language, planned.profile), "")
+            row = _row_for_action(plan.rows, planned)
             try:
                 if planned.action in {"activate", "update"} and row:
                     self.client.activate_rule(
@@ -176,22 +232,38 @@ class ProfileSyncService:
                         params=row.params,
                         prioritized_rule=row.prioritizedRule,
                     )
-                    actions.append(_applied(planned))
-                elif planned.action == "deactivate":
+                    return _applied(planned)
+                if planned.action == "deactivate":
                     self.client.deactivate_rule(profile_key, planned.rule_key)
-                    actions.append(_applied(planned))
-                else:
-                    actions.append(planned)
+                    return _applied(planned)
+                return planned
             except SonarQubeError as exc:
-                actions.append(_api_error(planned.action, exc, planned.language, planned.profile, planned.rule_key, planned.source_row))
+                return _api_error(planned.action, exc, planned.language, planned.profile, planned.rule_key, planned.source_row)
+
+        actions.extend(bounded_parallel_map(write_jobs, apply_one, client_write_workers(self.client, len(write_jobs))))
         return ProfileSyncResult(plan=plan, actions=actions)
 
-    def _rule_existence(self, rows: list[ProfileRuleRow], issues: list[ValidationIssue]) -> dict[str, bool]:
+    def _rule_existence(
+        self,
+        rows: list[ProfileRuleRow],
+        issues: list[ValidationIssue],
+        server_rules: dict[tuple[str, str, str], ProfileRuleRow] | None = None,
+    ) -> dict[str, bool]:
         result: dict[str, bool] = {}
-        for rule_key in sorted({row.rule_key for row in rows if row.rule_key}):
+        active_rule_keys = {rule_key for _language, _profile, rule_key in (server_rules or {})}
+        for rule_key in active_rule_keys:
+            result[rule_key] = True
+        rule_keys = sorted({row.rule_key for row in rows if row.rule_key and row.rule_key not in active_rule_keys})
+
+        def lookup(rule_key: str) -> tuple[str, bool, SonarQubeError | None]:
             try:
-                result[rule_key] = bool(self.client.search_rule(rule_key))
+                return (rule_key, bool(self.client.search_rule(rule_key)), None)
             except SonarQubeError as exc:
+                return (rule_key, False, exc)
+
+        for rule_key, exists, exc in bounded_parallel_map(rule_keys, lookup, client_read_workers(self.client, len(rule_keys))):
+            result[rule_key] = exists
+            if exc:
                 issues.append(
                     ValidationIssue(
                         status=ItemStatus.ERROR,
@@ -200,9 +272,8 @@ class ProfileSyncService:
                         suggestion="Check the SonarQube URL, token, and API availability.",
                     )
                 )
-                result[rule_key] = False
                 continue
-            if not result[rule_key]:
+            if not exists:
                 issues.append(
                     ValidationIssue(
                         status=ItemStatus.ERROR,
@@ -219,10 +290,24 @@ class ProfileSyncService:
         issues: list[ValidationIssue],
     ) -> dict[tuple[str, str, str], ProfileRuleRow]:
         result: dict[tuple[str, str, str], ProfileRuleRow] = {}
-        for (language, profile_name), profile_key in profile_keys.items():
+        targets = list(profile_keys.items())
+
+        def load(target: tuple[tuple[str, str], str]) -> tuple[str, str, list[ProfileRuleRow], SonarQubeError | None]:
+            (language, profile_name), profile_key = target
             try:
-                rows = ProfileExportService(self.client)._profile_rows(language, profile_key, profile_name, profile_name)
+                rows = ProfileExportService(self.client)._profile_rows(
+                    language,
+                    profile_key,
+                    profile_name,
+                    profile_name,
+                    include_activation_details=True,
+                )
+                return (language, profile_name, rows, None)
             except SonarQubeError as exc:
+                return (language, profile_name, [], exc)
+
+        for language, profile_name, rows, exc in bounded_parallel_map(targets, load, client_read_workers(self.client, len(targets))):
+            if exc:
                 issues.append(
                     ValidationIssue(
                         status=ItemStatus.ERROR,
@@ -372,6 +457,26 @@ def _activation_params(activation: dict) -> str:
                 parts.append(f"{item.get('key')}={item.get('value', '')}")
         return ";".join(parts)
     return str(params or "")
+
+
+def _activation_from_rule(rule: dict, profile_key: str) -> dict:
+    actives = rule.get("actives", [])
+    if isinstance(actives, list):
+        for active in actives:
+            if not isinstance(active, dict):
+                continue
+            active_profile_key = str(active.get("qProfile") or active.get("qProfileKey") or active.get("profileKey") or "")
+            if not active_profile_key or active_profile_key == profile_key:
+                return dict(active)
+    active = rule.get("active")
+    if isinstance(active, dict):
+        return dict(active)
+    return {}
+
+
+def _notify(progress: ProgressCallback | None, stage: str, value: float | None) -> None:
+    if progress:
+        progress(stage, value)
 
 
 def _normalized_rule_config(row: ProfileRuleRow) -> tuple[str, str, str]:

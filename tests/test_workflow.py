@@ -135,6 +135,25 @@ def test_precheck_copy_default_strategy_uses_selected_copy_source():
     assert result.profile_plans[0].source_profile == "Base"
 
 
+def test_precheck_copy_strategy_uses_source_profile_column():
+    rows = [
+        RuleRow(
+            source_row=2,
+            language="java",
+            target_profile="Demo",
+            rule_key="java:S1144",
+            strategy="copy",
+            source_profile="Base",
+        ),
+    ]
+
+    result = WorkflowService(FakeClient()).precheck(rows)
+
+    assert result.can_apply
+    assert result.profile_plans[0].strategy == ProfileStrategy.COPY
+    assert result.profile_plans[0].source_profile == "Base"
+
+
 def test_precheck_duplicate_rule_processed_once_with_warning():
     rows = [
         RuleRow(source_row=2, language="java", target_profile="Demo", rule_key="java:S1144"),

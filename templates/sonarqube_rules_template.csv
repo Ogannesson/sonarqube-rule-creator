@@ -1,3 +1,3 @@
-﻿language,target_profile,rule_key,parent_profile,strategy,severity,params,prioritizedRule,project_key,set_default
-java,PM Demo Java Profile,java:S1144,,extend_default,MAJOR,,false,,false
-js,PM Demo JS Profile,javascript:S1128,,extend_default,,,false,,false
+﻿rule_key,active,severity,params,prioritizedRule,note
+java:S1144,true,MAJOR,,false,
+javascript:S1128,true,,,false,

@@ -95,7 +95,13 @@ def _select_app_view(web: bool = False) -> ft.AppView:
 def _run_flet_app(view: ft.AppView) -> None:
     if view == ft.AppView.FLET_APP:
         _prepare_flet_desktop_runtime()
-    ft.run(main=app, name=APP_DISPLAY_NAME, view=view, host="127.0.0.1", port=0, assets_dir=str(_assets_dir()))
+    ft.run(main=app, name=_flet_app_name(view), view=view, host="127.0.0.1", port=0, assets_dir=str(_assets_dir()))
+
+
+def _flet_app_name(view: ft.AppView) -> str:
+    if view == ft.AppView.WEB_BROWSER:
+        return ""
+    return APP_DISPLAY_NAME
 
 
 def _assets_dir() -> Path:

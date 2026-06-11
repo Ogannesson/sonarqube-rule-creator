@@ -4,6 +4,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Iterable
 
+from .concurrency import bounded_parallel_map, client_read_workers, client_write_workers
 from .models import (
     ActionResult,
     ApplyResult,
@@ -129,15 +130,16 @@ class WorkflowService:
                     )
 
         rule_status: dict[str, ItemStatus] = {}
-        for rule_key in sorted({row.rule_key for row in normalized_rows if row.rule_key and _row_active(row)}):
+        for rule_key, rule, exc in self._lookup_rules(sorted({row.rule_key for row in normalized_rows if row.rule_key and _row_active(row)})):
             try:
-                rule = self.client.search_rule(rule_key)
-            except SonarQubeError as exc:
+                if exc:
+                    raise exc
+            except SonarQubeError as lookup_exc:
                 issues.append(
                     ValidationIssue(
                         status=ItemStatus.ERROR,
                         category="api_error",
-                        message=f"Rule lookup failed for {rule_key}: {exc}",
+                        message=f"Rule lookup failed for {rule_key}: {lookup_exc}",
                         suggestion="Check the SonarQube URL, token, and API availability.",
                     )
                 )
@@ -164,6 +166,15 @@ class WorkflowService:
             existing_profiles=existing_profiles,
             default_profiles=default_profiles,
         )
+
+    def _lookup_rules(self, rule_keys: list[str]) -> list[tuple[str, dict | None, SonarQubeError | None]]:
+        def lookup(rule_key: str) -> tuple[str, dict | None, SonarQubeError | None]:
+            try:
+                return (rule_key, self.client.search_rule(rule_key), None)
+            except SonarQubeError as exc:
+                return (rule_key, None, exc)
+
+        return bounded_parallel_map(rule_keys, lookup, client_read_workers(self.client, len(rule_keys)))
 
     def apply(self, precheck: PrecheckResult, backup_dir: Path | None = None) -> ApplyResult:
         actions: list[ActionResult] = []
@@ -305,6 +316,7 @@ class WorkflowService:
                         )
                     )
 
+        activation_jobs: list[RuleRow] = []
         for row in precheck.rows:
             if not _row_active(row):
                 actions.append(
@@ -349,6 +361,10 @@ class WorkflowService:
                     )
                 )
                 continue
+            activation_jobs.append(row)
+
+        def activate(row: RuleRow) -> ActionResult:
+            profile_key = profile_keys.get((row.language, row.target_profile), "")
             try:
                 self.client.activate_rule(
                     profile_key,
@@ -357,43 +373,38 @@ class WorkflowService:
                     params=row.params,
                     prioritized_rule=row.prioritizedRule,
                 )
-                actions.append(
-                    ActionResult(
-                        status=ItemStatus.OK,
-                        action="rule_activated",
-                        message="Rule activated.",
-                        language=row.language,
-                        profile=row.target_profile,
-                        rule_key=row.rule_key,
-                        source_row=row.source_row,
-                    )
+                return ActionResult(
+                    status=ItemStatus.OK,
+                    action="rule_activated",
+                    message="Rule activated.",
+                    language=row.language,
+                    profile=row.target_profile,
+                    rule_key=row.rule_key,
+                    source_row=row.source_row,
                 )
             except SonarQubeError as exc:
                 message = str(exc)
                 if "already" in message.casefold() or "active" in message.casefold():
-                    actions.append(
-                        ActionResult(
-                            status=ItemStatus.SKIPPED,
-                            action="rule_already_active",
-                            message="Rule already active.",
-                            language=row.language,
-                            profile=row.target_profile,
-                            rule_key=row.rule_key,
-                            source_row=row.source_row,
-                            api_error=message,
-                        )
+                    return ActionResult(
+                        status=ItemStatus.SKIPPED,
+                        action="rule_already_active",
+                        message="Rule already active.",
+                        language=row.language,
+                        profile=row.target_profile,
+                        rule_key=row.rule_key,
+                        source_row=row.source_row,
+                        api_error=message,
                     )
-                else:
-                    actions.append(
-                        self._api_error(
-                            "activate_rule",
-                            exc,
-                            row.language,
-                            row.target_profile,
-                            row.rule_key,
-                            row.source_row,
-                        )
-                    )
+                return self._api_error(
+                    "activate_rule",
+                    exc,
+                    row.language,
+                    row.target_profile,
+                    row.rule_key,
+                    row.source_row,
+                )
+
+        actions.extend(bounded_parallel_map(activation_jobs, activate, client_write_workers(self.client, len(activation_jobs))))
 
         return ApplyResult(precheck=precheck, actions=actions)
 
@@ -471,10 +482,16 @@ class WorkflowService:
         issues: list[ValidationIssue],
     ) -> dict[str, list[dict]]:
         result: dict[str, list[dict]] = {}
-        for language in languages:
+        language_list = list(languages)
+
+        def load(language: str) -> tuple[str, list[dict], SonarQubeError | None]:
             try:
-                result[language] = self.client.search_quality_profiles(language=language)
+                return (language, self.client.search_quality_profiles(language=language), None)
             except SonarQubeError as exc:
+                return (language, [], exc)
+
+        for language, profiles, exc in bounded_parallel_map(language_list, load, client_read_workers(self.client, len(language_list))):
+            if exc:
                 issues.append(
                     ValidationIssue(
                         status=ItemStatus.ERROR,
@@ -483,7 +500,7 @@ class WorkflowService:
                         suggestion="Check the language key and token permissions.",
                     )
                 )
-                result[language] = []
+            result[language] = profiles
         return result
 
     def _build_profile_plans(
@@ -504,7 +521,7 @@ class WorkflowService:
             first = group_rows[0]
             strategy = parse_strategy(first.strategy, default_strategy)
             parent_profile = first.parent_profile
-            source_profile = first.parent_profile
+            source_profile = first.source_profile
             if strategy == ProfileStrategy.EXTEND_DEFAULT:
                 parent_profile = parent_profile or default_profiles.get(language, "")
             if strategy == ProfileStrategy.EXTEND_SELECTED:

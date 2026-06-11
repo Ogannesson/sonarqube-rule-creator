@@ -11,6 +11,7 @@ import keyring
 APP_NAME = "SonarQubeProfileCreator"
 APP_DISPLAY_NAME = "SonarQube Profile Creator"
 TOKEN_SERVICE = "sonarqube-profile-creator"
+TRUE_CONFIG_VALUES = {"1", "true", "yes", "y", "on", "是"}
 
 
 def user_config_dir() -> Path:
@@ -33,6 +34,10 @@ class AppConfig:
     last_file: str = ""
     language: str = ""
     default_strategy: str = "extend_default"
+    target_language: str = ""
+    target_profile: str = ""
+    project_key: str = ""
+    set_default: bool = False
     last_mapping: dict[str, str] = field(default_factory=dict)
 
 
@@ -53,6 +58,10 @@ class ConfigStore:
             last_file=str(data.get("last_file", "")),
             language=str(data.get("language", "")),
             default_strategy=str(data.get("default_strategy", "extend_default")),
+            target_language=str(data.get("target_language", "")),
+            target_profile=str(data.get("target_profile", "")),
+            project_key=str(data.get("project_key", "")),
+            set_default=_config_bool(data.get("set_default", False)),
             last_mapping=dict(data.get("last_mapping", {})),
         )
 
@@ -63,6 +72,10 @@ class ConfigStore:
             "last_file": config.last_file,
             "language": config.language,
             "default_strategy": config.default_strategy,
+            "target_language": config.target_language,
+            "target_profile": config.target_profile,
+            "project_key": config.project_key,
+            "set_default": config.set_default,
             "last_mapping": config.last_mapping,
         }
         self.config_path.write_text(
@@ -91,3 +104,13 @@ def reports_dir() -> Path:
     path = user_config_dir() / "reports"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _config_bool(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().casefold() in TRUE_CONFIG_VALUES
+    return False

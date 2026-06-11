@@ -563,18 +563,20 @@ def test_connection_catalog_worker_updates_profiles_before_capabilities():
     assert calls[-1] == ("render", False, False)
 
 
-def test_profile_export_dir_uses_exe_directory_when_frozen(monkeypatch):
+def test_profile_export_dir_uses_exe_directory_when_frozen(monkeypatch, tmp_path):
+    exe_path = tmp_path / "SonarQubeProfileCreator.exe"
     monkeypatch.setattr(gui.sys, "frozen", True, raising=False)
-    monkeypatch.setattr(gui.sys, "executable", r"C:\tools\SonarQubeProfileCreator.exe")
+    monkeypatch.setattr(gui.sys, "executable", str(exe_path))
 
-    assert profile_export_dir() == gui.Path(r"C:\tools")
+    assert profile_export_dir() == tmp_path
 
 
-def test_visible_reports_dir_uses_exe_directory_when_frozen(monkeypatch):
+def test_visible_reports_dir_uses_exe_directory_when_frozen(monkeypatch, tmp_path):
+    exe_path = tmp_path / "SonarQubeProfileCreator.exe"
     monkeypatch.setattr(gui.sys, "frozen", True, raising=False)
-    monkeypatch.setattr(gui.sys, "executable", r"C:\tools\SonarQubeProfileCreator.exe")
+    monkeypatch.setattr(gui.sys, "executable", str(exe_path))
 
-    assert visible_reports_dir() == gui.Path(r"C:\tools\reports")
+    assert visible_reports_dir() == tmp_path / "reports"
 
 
 def test_default_profiles_are_derived_from_loaded_profiles():
